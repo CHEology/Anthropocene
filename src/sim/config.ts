@@ -1,4 +1,4 @@
-﻿import type { SimulationConfig, SimulationGlobals } from './types';
+﻿import type { SimulationConfig, SimulationGlobals } from './types.js';
 
 export const DEFAULT_GLOBALS: SimulationGlobals = {
   G_birth: 0.035,

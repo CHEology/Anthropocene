@@ -1,6 +1,6 @@
-﻿import { createInitialWorldState } from '../world/oldWorld';
-import { cloneSimulationConfig } from './config';
-import { createPrng, type Prng } from './prng';
+﻿import { createInitialWorldState } from '../world/oldWorld.js';
+import { cloneSimulationConfig } from './config.js';
+import { createPrng, type Prng } from './prng.js';
 import type {
   AbilityKey,
   ClimatePulseEffect,
@@ -13,7 +13,15 @@ import type {
   TribeState,
   WorldMetrics,
   WorldState,
-} from './types';
+} from './types.js';
+
+const MAX_ENGINE_BATCH_YEARS = 4096;
+const TARGET_BASELINE_TEMPERATURE = 15;
+const MIN_TRIBE_POPULATION = 25;
+const MAX_TRIBE_POPULATION = 1_000_000;
+const POPULATION_CARRY_LIMIT = 0.999999;
+const TRIBE_SPLIT_THRESHOLD = 180;
+const TRIBE_RELATION_CAP = 0.9;
 
 const PHASES: SimulationPhase[] = [
   'global-events',
@@ -35,11 +43,34 @@ export interface SimulationEngine {
 }
 
 function clamp(value: number, min: number, max: number) {
+  if (!Number.isFinite(value)) {
+    return min;
+  }
+
   return Math.min(max, Math.max(min, value));
 }
 
 function round(value: number, digits = 3) {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+
   return Number(value.toFixed(digits));
+}
+
+function normalizeStepYears(years = 1) {
+  if (!Number.isFinite(years)) {
+    throw new RangeError('Simulation step years must be finite.');
+  }
+
+  const wholeYears = Math.trunc(years);
+  if (wholeYears < 1 || wholeYears > MAX_ENGINE_BATCH_YEARS) {
+    throw new RangeError(
+      `Simulation step years must be between 1 and ${MAX_ENGINE_BATCH_YEARS}.`,
+    );
+  }
+
+  return wholeYears;
 }
 
 function cloneState(state: WorldState) {
@@ -178,31 +209,61 @@ function applyTilePhase(read: WorldState, write: WorldState, changedTileIds: Set
   for (const tile of write.tiles) {
     const previous = previousTiles.get(tile.id)!;
     const totalPopulation = occupancy.get(tile.id) ?? 0;
-    const totalCapacity =
-      previous.carryingCapacity.hunt +
-      previous.carryingCapacity.agri +
-      previous.carryingCapacity.water;
-    const overcrowdingPenalty =
-      Math.max(0, totalPopulation / Math.max(totalCapacity, 1) - 1) * 2.4;
-    const climateDrift = write.globalClimate.meanTemperature - previous.baseTemperature;
+    const totalFoodCapacity =
+      previous.carryingCapacity.hunt + previous.carryingCapacity.agri;
+    const occupancyRatio = totalPopulation / Math.max(totalFoodCapacity, 1);
+    const climateShift = Math.abs(write.globalClimate.meanTemperature - TARGET_BASELINE_TEMPERATURE);
+    const climateStress = clamp(Math.max(0, climateShift - 1.5) / 8, 0, 0.45);
     const terrainPenalty =
       tile.terrain === 'mountain' ? 1.3 : tile.terrain === 'highland' ? 0.6 : 0;
+    const huntRecovery = Math.min(
+      previous.baseCarryingCapacity.hunt * 0.018,
+      previous.baseCarryingCapacity.hunt - previous.carryingCapacity.hunt,
+    );
+    const agriRecovery = Math.min(
+      previous.baseCarryingCapacity.agri * 0.012,
+      previous.baseCarryingCapacity.agri - previous.carryingCapacity.agri,
+    );
+    const huntOvershoot = Math.max(0, occupancyRatio - 0.78);
+    const agriOvershoot = Math.max(0, occupancyRatio - 0.9);
 
-    tile.temperature = round(tile.baseTemperature + (write.globalClimate.meanTemperature - 15), 2);
+    tile.temperature = round(
+      tile.baseTemperature + (write.globalClimate.meanTemperature - TARGET_BASELINE_TEMPERATURE),
+      2,
+    );
     tile.carryingCapacity.hunt = round(
-      previous.carryingCapacity.hunt +
-        (previous.baseCarryingCapacity.hunt - previous.carryingCapacity.hunt) * 0.05,
+      clamp(
+        previous.carryingCapacity.hunt * (1 - huntOvershoot * 0.18 - climateStress * 0.05) +
+          huntRecovery,
+        previous.baseCarryingCapacity.hunt > 0 ? previous.baseCarryingCapacity.hunt * 0.18 : 0,
+        previous.baseCarryingCapacity.hunt,
+      ),
       2,
     );
     tile.carryingCapacity.agri = round(
-      previous.carryingCapacity.agri +
-        (previous.baseCarryingCapacity.agri - previous.carryingCapacity.agri) * 0.05,
+      clamp(
+        previous.carryingCapacity.agri * (1 - agriOvershoot * 0.1 - climateStress * 0.03) +
+          agriRecovery,
+        previous.baseCarryingCapacity.agri > 0 ? previous.baseCarryingCapacity.agri * 0.25 : 0,
+        previous.baseCarryingCapacity.agri,
+      ),
       2,
     );
-    tile.carryingCapacity.water = previous.baseCarryingCapacity.water;
+    tile.carryingCapacity.water = round(
+      clamp(
+        previous.baseCarryingCapacity.water * (1 - climateStress * 0.2),
+        previous.baseCarryingCapacity.water > 0 ? previous.baseCarryingCapacity.water * 0.55 : 0,
+        previous.baseCarryingCapacity.water,
+      ),
+      2,
+    );
     tile.comfort = round(
       clamp(
-        tile.baseComfort - Math.abs(climateDrift) * 0.05 - terrainPenalty - overcrowdingPenalty,
+        tile.baseComfort -
+          climateShift * 0.08 -
+          terrainPenalty -
+          Math.max(0, occupancyRatio - 0.7) * 1.75 -
+          climateStress * 0.75,
         0.2,
         6,
       ),
@@ -213,52 +274,96 @@ function applyTilePhase(read: WorldState, write: WorldState, changedTileIds: Set
       previous.temperature !== tile.temperature ||
       previous.comfort !== tile.comfort ||
       previous.carryingCapacity.hunt !== tile.carryingCapacity.hunt ||
-      previous.carryingCapacity.agri !== tile.carryingCapacity.agri
+      previous.carryingCapacity.agri !== tile.carryingCapacity.agri ||
+      previous.carryingCapacity.water !== tile.carryingCapacity.water
     ) {
       changedTileIds.add(tile.id);
     }
   }
 }
 
-function derivePressures(tribe: TribeState, tile: TileState, tilePopulation: number) {
-  const effectiveForaging =
-    tile.carryingCapacity.hunt * (0.35 + tribe.abilities.foraging.current / 140);
-  const effectiveFarming =
-    tile.carryingCapacity.agri * (tribe.abilities.agriculture.current / 220);
-  const totalFoodCapacity = effectiveForaging + effectiveFarming;
-  const food = clamp(1 - totalFoodCapacity / Math.max(tribe.pop, 1), 0, 1);
+interface TribeResourceContext {
+  effectiveForaging: number;
+  effectiveFarming: number;
+  effectiveFood: number;
+  supportedByWater: number;
+  carryingCapacity: number;
+  pressures: TribeState['pressures'];
+}
+
+function computeTribeResourceContext(
+  tribe: TribeState,
+  tile: TileState,
+  tilePopulation: number,
+): TribeResourceContext {
+  const safeTilePopulation = Math.max(tilePopulation, tribe.pop, 1);
+  const share = clamp(tribe.pop / safeTilePopulation, 0.08, 1);
+  const effectiveForaging = round(
+    tile.carryingCapacity.hunt * share * (0.55 + tribe.abilities.foraging.current / 95),
+    2,
+  );
+  const effectiveFarming = round(
+    tile.carryingCapacity.agri * share * (tribe.abilities.agriculture.current / 105),
+    2,
+  );
+  const effectiveFood = round(effectiveForaging + effectiveFarming, 2);
+  const supportedByWater = round(
+    ((tile.carryingCapacity.water *
+      share *
+      (0.62 + tribe.abilities.waterEngineering.current / 150)) /
+      0.55),
+    2,
+  );
   const heat = clamp(
-    (tile.temperature - 22 - tribe.abilities.heatTolerance.current * 0.28) / 20,
+    (tile.temperature - (18 + tribe.abilities.heatTolerance.current * 0.22)) / 16,
     0,
     1,
   );
   const cold = clamp(
-    (5 - tile.temperature + tribe.abilities.coldTolerance.current * 0.26) / 20,
+    ((10 - tribe.abilities.coldTolerance.current * 0.28) - tile.temperature) / 16,
     0,
     1,
   );
-  const water = clamp(
-    (3 - tile.water) / 4 - tribe.abilities.waterEngineering.current / 200,
-    0,
-    1,
-  );
+  const food = clamp(1 - effectiveFood / Math.max(tribe.pop, 1), 0, 1);
+  const water = clamp(1 - supportedByWater / Math.max(tribe.pop, 1), 0, 1);
   const competition = clamp(
     tilePopulation / Math.max(tile.carryingCapacity.hunt + tile.carryingCapacity.agri, 1) - 0.65,
     0,
     1,
   );
-  const organization = clamp(tribe.pop / 320 - tribe.abilities.organization.current / 120, 0, 1);
+  const organization = clamp(tribe.pop / 150 - tribe.abilities.organization.current / 100, 0, 1);
+  const carryingCapacity = round(
+    clamp(
+      Math.min(effectiveFood, supportedByWater) +
+        tile.comfort * 11 +
+        tribe.abilities.organization.current * 0.4,
+      MIN_TRIBE_POPULATION * 2,
+      MAX_TRIBE_POPULATION,
+    ),
+    2,
+  );
   const total = round((food + heat + cold + water + competition + organization) / 6, 3);
 
   return {
-    food: round(food),
-    heat: round(heat),
-    cold: round(cold),
-    water: round(water),
-    competition: round(competition),
-    organization: round(organization),
-    total,
+    effectiveForaging,
+    effectiveFarming,
+    effectiveFood,
+    supportedByWater,
+    carryingCapacity,
+    pressures: {
+      food: round(food),
+      heat: round(heat),
+      cold: round(cold),
+      water: round(water),
+      competition: round(competition),
+      organization: round(organization),
+      total,
+    },
   };
+}
+
+function derivePressures(tribe: TribeState, tile: TileState, tilePopulation: number) {
+  return computeTribeResourceContext(tribe, tile, tilePopulation).pressures;
 }
 
 function pickAbility(tribe: TribeState, prng: Prng) {
@@ -302,10 +407,12 @@ function applyTribePhase(
   prng: Prng,
   events: SimulationEvent[],
   changedTribeIds: Set<string>,
+  populationCarry: Map<string, number>,
 ) {
   const readTileMap = tilesById(read);
   const readTribeMap = tribesById(read);
   const writeTribeMap = tribesById(write);
+  const writeTileMap = tilesById(write);
   const occupancy = occupancyByTile(read);
   const orderedIds = shuffleIds(
     read.tribes.map((tribe) => tribe.id),
@@ -316,18 +423,24 @@ function applyTribePhase(
     const source = readTribeMap.get(tribeId)!;
     const target = writeTribeMap.get(tribeId)!;
     const tile = readTileMap.get(source.tileId)!;
+    const writeTile = writeTileMap.get(source.tileId)!;
     const previousPop = target.pop;
 
     target.statusFlags.migrating = false;
     target.statusFlags.recovering = false;
 
-    const nextPressures = derivePressures(source, tile, occupancy.get(source.tileId) ?? source.pop);
+    const resourceContext = computeTribeResourceContext(
+      source,
+      tile,
+      occupancy.get(source.tileId) ?? source.pop,
+    );
+    const nextPressures = resourceContext.pressures;
     target.pressures = nextPressures;
 
     const innovationProbability =
       config.globals.G_innovation *
-      clamp(Math.log10(Math.max(source.pop, 10)) / 2.6, 0.12, 1.8) *
-      (1 + nextPressures.total * 2.5);
+      clamp(Math.log10(Math.max(source.pop, 10)) / 2.4, 0.18, 1.85) *
+      (1 + nextPressures.total * 2.8);
 
     if (prng.next() < innovationProbability) {
       const ability = pickAbility(target, prng);
@@ -356,20 +469,79 @@ function applyTribePhase(
       );
     }
 
-    const birthRate =
-      config.globals.G_birth *
-      clamp(1 - nextPressures.food * 0.75, 0.2, 1.15) *
-      clamp(1 - (nextPressures.heat + nextPressures.cold) * 0.25, 0.65, 1.05);
-    const deathRate =
+    const carryingCapacity = resourceContext.carryingCapacity;
+    const densityPressure = clamp(source.pop / Math.max(carryingCapacity, 1) - 0.84, 0, 1.4);
+    const foodMultiplier = clamp(1 - nextPressures.food * 0.8, 0.08, 1.2);
+    const comfortMultiplier = clamp(1 - (nextPressures.heat + nextPressures.cold) * 0.3, 0.5, 1.1);
+    const orgMultiplier = 1 + target.abilities.organization.current * 0.005;
+    const densityMultiplier = clamp(1 - densityPressure * 0.7, 0.05, 1.05);
+    const favorableGrowthBonus = clamp(
+      (carryingCapacity / Math.max(source.pop, 1) - 1) * 0.02,
+      0,
+      0.009,
+    );
+    const birthRate = clamp(
+      (config.globals.G_birth + favorableGrowthBonus) *
+        foodMultiplier *
+        comfortMultiplier *
+        orgMultiplier *
+        densityMultiplier,
+      0,
+      0.18,
+    );
+    const alleePenalty =
+      source.pop < MIN_TRIBE_POPULATION
+        ? ((MIN_TRIBE_POPULATION - source.pop) / MIN_TRIBE_POPULATION) * 0.08
+        : 0;
+    const deathRate = clamp(
       config.globals.G_death +
-      nextPressures.food * 0.04 +
-      nextPressures.water * 0.03 +
-      nextPressures.competition * 0.02;
+        nextPressures.food * 0.04 +
+        nextPressures.water * 0.05 +
+        nextPressures.cold * 0.03 +
+        nextPressures.heat * 0.03 +
+        nextPressures.competition * 0.02 +
+        Math.max(0, source.pop / Math.max(carryingCapacity, 1) - 1) * 0.08 +
+        alleePenalty,
+      0.001,
+      0.24,
+    );
 
-    const births = Math.floor(source.pop * birthRate);
-    const deaths = Math.floor(source.pop * deathRate);
-    target.pop = Math.max(18, source.pop + births - deaths);
+    const previousCarry = populationCarry.get(target.id) ?? 0;
+    const netExact = source.pop * (birthRate - deathRate) + previousCarry;
+    const netWhole = netExact >= 0 ? Math.floor(netExact) : Math.ceil(netExact);
+    populationCarry.set(
+      target.id,
+      clamp(netExact - netWhole, -POPULATION_CARRY_LIMIT, POPULATION_CARRY_LIMIT),
+    );
+    target.pop = clamp(source.pop + netWhole, 0, MAX_TRIBE_POPULATION);
     target.statusFlags.recovering = target.pop > source.pop;
+
+    const foragingShare = clamp(0.85 - target.abilities.agriculture.current / 120, 0.22, 0.95);
+    const foragingLoad = source.pop * foragingShare;
+    const farmingLoad =
+      source.pop * (1 - foragingShare) * (0.6 + target.abilities.agriculture.current / 140);
+    const huntDepletion =
+      foragingLoad * 0.022 +
+      Math.max(0, foragingLoad - tile.carryingCapacity.hunt * 0.8) * 0.08;
+    const agriDepletion =
+      farmingLoad * 0.018 +
+      Math.max(0, farmingLoad - tile.carryingCapacity.agri * 0.88) * 0.06;
+    writeTile.carryingCapacity.hunt = round(
+      clamp(
+        writeTile.carryingCapacity.hunt - huntDepletion,
+        tile.baseCarryingCapacity.hunt > 0 ? tile.baseCarryingCapacity.hunt * 0.18 : 0,
+        tile.baseCarryingCapacity.hunt,
+      ),
+      2,
+    );
+    writeTile.carryingCapacity.agri = round(
+      clamp(
+        writeTile.carryingCapacity.agri - agriDepletion,
+        tile.baseCarryingCapacity.agri > 0 ? tile.baseCarryingCapacity.agri * 0.25 : 0,
+        tile.baseCarryingCapacity.agri,
+      ),
+      2,
+    );
 
     if (target.pop !== previousPop || target.pressures.total !== source.pressures.total) {
       changedTribeIds.add(target.id);
@@ -416,28 +588,33 @@ function applyMigrationPhase(
   const occupancy = occupancyByTile(read);
 
   for (const tribe of read.tribes) {
-    if (tribe.pressures.total < 0.55) {
+    const migrationPressure = Math.max(
+      tribe.pressures.total,
+      tribe.pressures.food * 1.2,
+      tribe.pressures.water * 1.1,
+    );
+    if (migrationPressure < 0.26) {
       continue;
     }
 
     const currentTile = readTiles.get(tribe.tileId)!;
     const currentScore =
-      currentTile.comfort * 2 +
-      currentTile.water +
-      (currentTile.carryingCapacity.hunt + currentTile.carryingCapacity.agri) / 120;
+      currentTile.comfort * 2.4 +
+      currentTile.water * 0.9 +
+      (currentTile.carryingCapacity.hunt + currentTile.carryingCapacity.agri) / 95;
 
     let bestTile = currentTile;
     let bestScore = currentScore;
 
     for (const neighborId of currentTile.neighbors) {
       const neighbor = readTiles.get(neighborId)!;
-      const occupancyPenalty = (occupancy.get(neighbor.id) ?? 0) / 150;
+      const occupancyPenalty = (occupancy.get(neighbor.id) ?? 0) / 120;
       const score =
-        neighbor.comfort * 2 +
-        neighbor.water +
-        (neighbor.carryingCapacity.hunt + neighbor.carryingCapacity.agri) / 120 -
-        occupancyPenalty -
-        (neighbor.terrain === 'desert' ? 1.4 : 0);
+        neighbor.comfort * 2.4 +
+        neighbor.water * 0.9 +
+        (neighbor.carryingCapacity.hunt + neighbor.carryingCapacity.agri) / 95 -
+        occupancyPenalty * 1.2 -
+        (neighbor.terrain === 'desert' ? 1.6 : 0);
 
       if (score > bestScore) {
         bestScore = score;
@@ -445,10 +622,18 @@ function applyMigrationPhase(
       }
     }
 
+    const opportunity = bestScore - currentScore;
+    const migrationChance = clamp(
+      config.globals.G_migration *
+        (0.45 + migrationPressure * 2.6 + Math.max(opportunity, 0) * 0.35),
+      0.05,
+      0.85,
+    );
+
     if (
       bestTile.id !== currentTile.id &&
-      bestScore > currentScore + 0.35 &&
-      prng.next() < config.globals.G_migration * (1 + tribe.pressures.total * 1.8)
+      opportunity > 0.15 &&
+      prng.next() < migrationChance
     ) {
       const target = writeTribes.get(tribe.id)!;
       target.tileId = bestTile.id;
@@ -465,6 +650,134 @@ function applyMigrationPhase(
       });
     }
   }
+}
+
+function applyFissionPhase(
+  read: WorldState,
+  write: WorldState,
+  config: SimulationConfig,
+  prng: Prng,
+  events: SimulationEvent[],
+  changedTribeIds: Set<string>,
+  populationCarry: Map<string, number>,
+) {
+  const writeTribes = tribesById(write);
+  const nextTribes = [...write.tribes];
+
+  for (const source of read.tribes) {
+    if (source.pop < TRIBE_SPLIT_THRESHOLD) {
+      continue;
+    }
+
+    const target = writeTribes.get(source.id);
+    if (!target) {
+      continue;
+    }
+
+    const splitPressure = clamp(
+      (source.pop - 150) / 260 +
+        source.pressures.competition * 0.55 +
+        source.pressures.organization * 0.35 +
+        (1 - config.globals.G_cohesion) -
+        target.abilities.organization.current / 420,
+      0,
+      0.8,
+    );
+
+    if (splitPressure < 0.18 || prng.next() >= splitPressure) {
+      continue;
+    }
+
+    const childPop = clamp(
+      Math.floor(source.pop * (0.32 + prng.next() * 0.12)),
+      MIN_TRIBE_POPULATION,
+      source.pop - MIN_TRIBE_POPULATION,
+    );
+    if (childPop < MIN_TRIBE_POPULATION || source.pop - childPop < MIN_TRIBE_POPULATION) {
+      continue;
+    }
+
+    const childId = `${source.id}-branch-${write.year}-${events.length}`;
+    target.pop = source.pop - childPop;
+    target.relationships = {
+      ...target.relationships,
+      [childId]: round(TRIBE_RELATION_CAP * 0.4, 2),
+    };
+    changedTribeIds.add(target.id);
+
+    const child: TribeState = {
+      ...structuredClone(target),
+      id: childId,
+      name: `${source.name} Branch`,
+      pop: childPop,
+      color: source.color,
+      leader: null,
+      relationships: {
+        [source.id]: round(TRIBE_RELATION_CAP * 0.4, 2),
+      },
+      alliances: [],
+      statusFlags: {
+        migrating: false,
+        recovering: false,
+        highlighted: false,
+      },
+    };
+
+    for (const ability of Object.keys(child.abilities) as AbilityKey[]) {
+      const drift = prng.nextInt(-2, 2);
+      child.abilities[ability].cap = clamp(child.abilities[ability].cap + drift, 0, 100);
+      child.abilities[ability].current = clamp(
+        child.abilities[ability].current + drift,
+        0,
+        child.abilities[ability].cap,
+      );
+    }
+
+    nextTribes.push(child);
+    populationCarry.set(child.id, 0);
+    changedTribeIds.add(child.id);
+    events.push({
+      id: eventId('system', write.year, events.length),
+      year: write.year,
+      kind: 'system',
+      title: `${source.name} split`,
+      detail: `${source.name} exceeded cohesive scale and divided into a new branch at population ${source.pop}.`,
+      tribeId: source.id,
+      tileId: source.tileId,
+    });
+  }
+
+  write.tribes = nextTribes;
+}
+
+function applyExtinctionPhase(
+  state: WorldState,
+  events: SimulationEvent[],
+  changedTribeIds: Set<string>,
+  populationCarry: Map<string, number>,
+) {
+  const survivors: TribeState[] = [];
+
+  for (const tribe of state.tribes) {
+    if (tribe.pop > 0) {
+      survivors.push(tribe);
+      continue;
+    }
+
+    populationCarry.delete(tribe.id);
+    changedTribeIds.add(tribe.id);
+    events.push({
+      id: eventId('warning', state.year, events.length),
+      year: state.year,
+      kind: 'warning',
+      title: `${tribe.name} collapsed`,
+      detail: `${tribe.name} fell below a viable population threshold and disappeared.`,
+      tribeId: tribe.id,
+      tileId: tribe.tileId,
+    });
+  }
+
+  state.tribes = survivors;
 }
 
 function finalizeState(
@@ -489,6 +802,7 @@ export function createSimulationEngine(initialConfig: SimulationConfig): Simulat
   let config = cloneSimulationConfig(initialConfig);
   let state = createInitialWorldState(config);
   let prng = createPrng(config.seed);
+  let populationCarry = new Map(state.tribes.map((tribe) => [tribe.id, 0]));
 
   function stepOnce(): SimulationStepResult {
     const previousYear = state.year;
@@ -498,26 +812,48 @@ export function createSimulationEngine(initialConfig: SimulationConfig): Simulat
     const changedTribeIds = new Set<string>();
 
     let current = cloneState(state);
-    let staging = cloneState(current);
+    let staging = cloneState(state);
 
     applyGlobalPhase(current, staging, config, emittedEvents);
-    current = cloneState(staging);
+    current = staging;
 
     staging = cloneState(current);
     applyTilePhase(current, staging, changedTileIds);
-    current = cloneState(staging);
+    current = staging;
 
     staging = cloneState(current);
     if (config.enabledSystems.tribeDynamics) {
-      applyTribePhase(current, staging, config, prng, emittedEvents, changedTribeIds);
+      applyTribePhase(
+        current,
+        staging,
+        config,
+        prng,
+        emittedEvents,
+        changedTribeIds,
+        populationCarry,
+      );
     }
-    current = cloneState(staging);
+    current = staging;
 
     applyInteractionPhase(current, emittedEvents);
 
     staging = cloneState(current);
     applyMigrationPhase(current, staging, config, prng, emittedEvents, changedTribeIds);
-    current = cloneState(staging);
+    current = staging;
+
+    staging = cloneState(current);
+    applyFissionPhase(
+      current,
+      staging,
+      config,
+      prng,
+      emittedEvents,
+      changedTribeIds,
+      populationCarry,
+    );
+    current = staging;
+
+    applyExtinctionPhase(current, emittedEvents, changedTribeIds, populationCarry);
 
     current = finalizeState(current, previousMetrics, emittedEvents);
     state = current;
@@ -547,8 +883,9 @@ export function createSimulationEngine(initialConfig: SimulationConfig): Simulat
       return cloneSimulationConfig(config);
     },
     step(years = 1) {
+      const stepYears = normalizeStepYears(years);
       let result = stepOnce();
-      for (let index = 1; index < years; index += 1) {
+      for (let index = 1; index < stepYears; index += 1) {
         result = stepOnce();
       }
       return result;
@@ -562,10 +899,11 @@ export function createSimulationEngine(initialConfig: SimulationConfig): Simulat
       config = cloneSimulationConfig(nextConfig);
       state = createInitialWorldState(config);
       prng = createPrng(config.seed);
+      populationCarry = new Map(state.tribes.map((tribe) => [tribe.id, 0]));
       return this.getState();
     },
     setRuntimeSpeed(yearsPerSecond) {
-      config.runtime.yearsPerSecond = yearsPerSecond;
+      config.runtime.yearsPerSecond = clamp(yearsPerSecond, 1, 240);
     },
   };
 }

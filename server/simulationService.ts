@@ -1,0 +1,241 @@
+import { randomUUID } from 'node:crypto';
+
+import { cloneSimulationConfig } from '../src/sim/config.js';
+import { createSimulationEngine } from '../src/sim/engine.js';
+import type {
+  InterventionCommand,
+  SimulationConfig,
+  SimulationStepResult,
+  WorldState,
+} from '../src/sim/types.js';
+import { ApiError } from './core/errors.js';
+import { SERVER_LIMITS } from './core/limits.js';
+import {
+  assertWorldStateInvariants,
+  sanitizeInterventionInput,
+  sanitizeSimulationConfig,
+  sanitizeStepYears,
+  trimStateForTransport,
+  type DeepPartial,
+} from './core/validation.js';
+
+interface SessionRecord {
+  id: string;
+  engine: ReturnType<typeof createSimulationEngine>;
+  config: SimulationConfig;
+  createdAt: number;
+  lastAccessAt: number;
+  advancedYears: number;
+}
+
+interface SessionResultSummary extends Omit<SimulationStepResult, 'state'> {
+  requestedYears: number;
+}
+
+export interface SessionSnapshot {
+  id: string;
+  createdAt: string;
+  lastAccessAt: string;
+  advancedYears: number;
+  config: SimulationConfig;
+  state: WorldState;
+  limits: {
+    maxYearsPerRequest: number;
+    maxYearsPerSession: number;
+    maxPendingInterventions: number;
+  };
+}
+
+export interface SessionStepResponse {
+  session: SessionSnapshot;
+  result: SessionResultSummary;
+}
+
+export interface SimulationServiceOptions {
+  now?: () => number;
+}
+
+function iso(timestamp: number) {
+  return new Date(timestamp).toISOString();
+}
+
+export class SimulationService {
+  private readonly sessions = new Map<string, SessionRecord>();
+  private readonly now: () => number;
+
+  constructor(options: SimulationServiceOptions = {}) {
+    this.now = options.now ?? (() => Date.now());
+  }
+
+  createSession(input?: DeepPartial<SimulationConfig>) {
+    this.pruneSessions();
+
+    const config = sanitizeSimulationConfig(input);
+    const engine = createSimulationEngine(config);
+    const now = this.now();
+    const record: SessionRecord = {
+      id: randomUUID(),
+      engine,
+      config,
+      createdAt: now,
+      lastAccessAt: now,
+      advancedYears: 0,
+    };
+
+    assertWorldStateInvariants(record.engine.getState());
+    this.sessions.set(record.id, record);
+    return this.snapshot(record);
+  }
+
+  getSessionSnapshot(sessionId: string) {
+    const record = this.getRecord(sessionId);
+    return this.snapshot(record);
+  }
+
+  stepSession(sessionId: string, yearsInput: unknown): SessionStepResponse {
+    const record = this.getRecord(sessionId);
+    const currentState = record.engine.getState();
+    const requestedYears = sanitizeStepYears(yearsInput, currentState.year);
+    let remaining = requestedYears;
+    let finalResult: SimulationStepResult | null = null;
+
+    while (remaining > 0) {
+      const chunk = Math.min(remaining, SERVER_LIMITS.stepChunkYears);
+      finalResult = record.engine.step(chunk);
+      assertWorldStateInvariants(finalResult.state);
+      remaining -= chunk;
+    }
+
+    if (!finalResult) {
+      throw new ApiError(500, 'step_failed', 'The simulation did not produce a step result.');
+    }
+
+    record.advancedYears += requestedYears;
+    record.lastAccessAt = this.now();
+
+    return {
+      session: this.snapshot(record, finalResult.state),
+      result: {
+        previousYear: finalResult.previousYear,
+        nextYear: finalResult.nextYear,
+        emittedEvents: finalResult.emittedEvents,
+        changedTileIds: finalResult.changedTileIds,
+        changedTribeIds: finalResult.changedTribeIds,
+        metricsDelta: finalResult.metricsDelta,
+        phases: finalResult.phases,
+        requestedYears,
+      },
+    };
+  }
+
+  enqueueIntervention(sessionId: string, input: unknown) {
+    const record = this.getRecord(sessionId);
+    const state = record.engine.getState();
+    if (state.pendingInterventions.length >= SERVER_LIMITS.maxPendingInterventions) {
+      throw new ApiError(
+        422,
+        'intervention_queue_full',
+        `A session may queue at most ${SERVER_LIMITS.maxPendingInterventions} interventions.`,
+      );
+    }
+
+    const command: InterventionCommand = sanitizeInterventionInput(input, state.year);
+    record.engine.enqueueIntervention(command);
+    record.lastAccessAt = this.now();
+
+    const nextState = record.engine.getState();
+    assertWorldStateInvariants(nextState);
+    return {
+      session: this.snapshot(record, nextState),
+      command,
+    };
+  }
+
+  resetSession(sessionId: string, input?: DeepPartial<SimulationConfig>) {
+    const record = this.getRecord(sessionId);
+    const nextConfig = sanitizeSimulationConfig(input, record.config);
+    record.config = nextConfig;
+    record.engine.reset(nextConfig);
+    record.advancedYears = 0;
+    record.lastAccessAt = this.now();
+
+    const state = record.engine.getState();
+    assertWorldStateInvariants(state);
+    return this.snapshot(record, state);
+  }
+
+  deleteSession(sessionId: string) {
+    if (!this.sessions.delete(sessionId)) {
+      throw new ApiError(404, 'session_not_found', 'Simulation session not found.');
+    }
+  }
+
+  getHealth() {
+    this.pruneSessions();
+    return {
+      status: 'ok' as const,
+      sessions: {
+        active: this.sessions.size,
+        max: SERVER_LIMITS.maxSessions,
+        ttlMs: SERVER_LIMITS.sessionTtlMs,
+      },
+      limits: {
+        maxYearsPerRequest: SERVER_LIMITS.maxYearsPerRequest,
+        maxYearsPerSession: SERVER_LIMITS.maxYearsPerSession,
+        stepChunkYears: SERVER_LIMITS.stepChunkYears,
+      },
+    };
+  }
+
+  private snapshot(record: SessionRecord, stateInput?: WorldState): SessionSnapshot {
+    const state = trimStateForTransport(stateInput ?? record.engine.getState());
+    assertWorldStateInvariants(state);
+
+    return {
+      id: record.id,
+      createdAt: iso(record.createdAt),
+      lastAccessAt: iso(record.lastAccessAt),
+      advancedYears: record.advancedYears,
+      config: cloneSimulationConfig(record.config),
+      state,
+      limits: {
+        maxYearsPerRequest: SERVER_LIMITS.maxYearsPerRequest,
+        maxYearsPerSession: SERVER_LIMITS.maxYearsPerSession,
+        maxPendingInterventions: SERVER_LIMITS.maxPendingInterventions,
+      },
+    };
+  }
+
+  private getRecord(sessionId: string) {
+    this.pruneSessions();
+
+    const record = this.sessions.get(sessionId);
+    if (!record) {
+      throw new ApiError(404, 'session_not_found', 'Simulation session not found.');
+    }
+
+    record.lastAccessAt = this.now();
+    return record;
+  }
+
+  private pruneSessions() {
+    const now = this.now();
+    for (const [sessionId, record] of this.sessions) {
+      if (now - record.lastAccessAt > SERVER_LIMITS.sessionTtlMs) {
+        this.sessions.delete(sessionId);
+      }
+    }
+
+    while (this.sessions.size >= SERVER_LIMITS.maxSessions) {
+      const oldest = [...this.sessions.values()].sort(
+        (left, right) => left.lastAccessAt - right.lastAccessAt,
+      )[0];
+
+      if (!oldest) {
+        break;
+      }
+
+      this.sessions.delete(oldest.id);
+    }
+  }
+}

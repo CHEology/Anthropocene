@@ -60,4 +60,22 @@ describe('simulation engine', () => {
     engine.step(1);
     expect(engine.getState().globalClimate.anomaly).toBe(2);
   });
+
+  it('keeps population and tribe structure evolving over long deterministic runs', () => {
+    const engine = createSimulationEngine(DEFAULT_SIMULATION_CONFIG);
+    const initial = engine.getState();
+    const populations = new Set<number>([initial.metrics.totalPopulation]);
+    const tribeCounts = new Set<number>([initial.metrics.tribeCount]);
+
+    for (let index = 0; index < 240; index += 1) {
+      engine.step(1);
+      const state = engine.getState();
+      populations.add(state.metrics.totalPopulation);
+      tribeCounts.add(state.metrics.tribeCount);
+    }
+
+    expect(populations.size).toBeGreaterThan(40);
+    expect(Math.max(...tribeCounts)).toBeGreaterThan(initial.metrics.tribeCount);
+    expect(engine.getState().metrics.totalPopulation).not.toBe(initial.metrics.totalPopulation);
+  });
 });

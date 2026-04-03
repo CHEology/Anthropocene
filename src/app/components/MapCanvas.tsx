@@ -1,8 +1,10 @@
 ﻿import { useEffect, useRef, useState } from 'react';
 
 import type { WorldPresentation, WorldState } from '../../sim/types';
+import { createHexPoints, createMapLayout, placeMapLabels } from './mapLayout';
 
 type LayerMode = 'comfort' | 'habitability' | 'water' | 'temperature';
+type ThemeMode = 'dark' | 'light';
 
 interface MapCanvasProps {
   worldState: WorldState;
@@ -13,6 +15,7 @@ interface MapCanvasProps {
   showRoutes: boolean;
   showLabels: boolean;
   showPressure: boolean;
+  themeMode: ThemeMode;
   onSelectTile(tileId: string): void;
   onHoverTile(tileId: string | null): void;
 }
@@ -20,6 +23,27 @@ interface MapCanvasProps {
 interface TileHitArea {
   tileId: string;
   points: Array<{ x: number; y: number }>;
+}
+
+interface MapPalette {
+  canvas: string;
+  grid: string;
+  frameFill: string;
+  frameStroke: string;
+  labelRegionFill: string;
+  labelRegionStroke: string;
+  labelTileFill: string;
+  labelTileStroke: string;
+  labelRegionText: string;
+  labelTileText: string;
+  labelDetail: string;
+  pressureHigh: string;
+  pressureMedium: string;
+  route: string;
+  selection: string;
+  hover: string;
+  markerOutline: string;
+  stats: string;
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -32,14 +56,50 @@ function blendColor(from: [number, number, number], to: [number, number, number]
   return `rgb(${channel(0)} ${channel(1)} ${channel(2)})`;
 }
 
-function pointyHexPoints(cx: number, cy: number, radius: number) {
-  return Array.from({ length: 6 }, (_, index) => {
-    const angle = ((60 * index - 30) * Math.PI) / 180;
+function getPalette(themeMode: ThemeMode): MapPalette {
+  if (themeMode === 'light') {
     return {
-      x: cx + radius * Math.cos(angle),
-      y: cy + radius * Math.sin(angle),
+      canvas: '#eef3f7',
+      grid: '#d8e1ea',
+      frameFill: '#f8fbfd',
+      frameStroke: '#c1ccd7',
+      labelRegionFill: '#e8eef4',
+      labelRegionStroke: '#a8b5c4',
+      labelTileFill: '#ffffff',
+      labelTileStroke: '#c4cfda',
+      labelRegionText: '#12202e',
+      labelTileText: '#233140',
+      labelDetail: '#617080',
+      pressureHigh: '#bf6545',
+      pressureMedium: '#997647',
+      route: '#6f8398',
+      selection: '#16212d',
+      hover: '#5d7387',
+      markerOutline: '#ffffff',
+      stats: '#5c6d7e',
     };
-  });
+  }
+
+  return {
+    canvas: '#0d1117',
+    grid: '#171d25',
+    frameFill: '#10161d',
+    frameStroke: '#202834',
+    labelRegionFill: '#11161d',
+    labelRegionStroke: '#556372',
+    labelTileFill: '#151b23',
+    labelTileStroke: '#394452',
+    labelRegionText: '#f3f6fa',
+    labelTileText: '#dfe6ee',
+    labelDetail: '#8d98a5',
+    pressureHigh: '#bf5f3c',
+    pressureMedium: '#8d6a3a',
+    route: '#5c6f82',
+    selection: '#f2f5f8',
+    hover: '#8ba1b7',
+    markerOutline: '#0f141a',
+    stats: '#9ba6b2',
+  };
 }
 
 function pointInPolygon(x: number, y: number, polygon: Array<{ x: number; y: number }>) {
@@ -61,30 +121,64 @@ function findTileAtPoint(x: number, y: number, hitAreas: TileHitArea[]) {
   return hitAreas.find((hitArea) => pointInPolygon(x, y, hitArea.points))?.tileId ?? null;
 }
 
-function getLayerColor(tile: WorldState['tiles'][number], layerMode: LayerMode) {
+function getLayerColor(tile: WorldState['tiles'][number], layerMode: LayerMode, themeMode: ThemeMode) {
   if (layerMode === 'habitability') {
-    return blendColor([108, 87, 61], [128, 176, 118], tile.habitability / 5.2);
+    return themeMode === 'light'
+      ? blendColor([197, 205, 214], [129, 171, 126], tile.habitability / 5.2)
+      : blendColor([82, 89, 97], [113, 161, 117], tile.habitability / 5.2);
   }
   if (layerMode === 'water') {
-    return blendColor([120, 93, 70], [88, 156, 193], tile.water / 6);
+    return themeMode === 'light'
+      ? blendColor([201, 208, 216], [110, 150, 187], tile.water / 6)
+      : blendColor([84, 88, 96], [72, 125, 168], tile.water / 6);
   }
   if (layerMode === 'temperature') {
-    return blendColor([79, 124, 172], [201, 117, 64], (tile.temperature + 5) / 40);
+    return themeMode === 'light'
+      ? blendColor([138, 171, 204], [216, 147, 118], (tile.temperature + 5) / 40)
+      : blendColor([80, 122, 171], [193, 110, 81], (tile.temperature + 5) / 40);
   }
-  return blendColor([98, 76, 57], [143, 186, 118], tile.comfort / 5.2);
+  return themeMode === 'light'
+    ? blendColor([188, 198, 208], [142, 171, 134], tile.comfort / 5.2)
+    : blendColor([79, 88, 95], [130, 154, 122], tile.comfort / 5.2);
 }
 
-function terrainStroke(terrain: WorldState['tiles'][number]['terrain']) {
-  if (terrain === 'desert') {
-    return 'rgba(255, 211, 145, 0.7)';
+function terrainStroke(tile: WorldState['tiles'][number], themeMode: ThemeMode) {
+  if (tile.terrain === 'desert') {
+    return themeMode === 'light' ? '#9f8660' : '#8e7755';
   }
-  if (terrain === 'mountain') {
-    return 'rgba(209, 223, 236, 0.8)';
+  if (tile.terrain === 'mountain' || tile.terrain === 'highland') {
+    return themeMode === 'light' ? '#8d97a3' : '#7f8a97';
   }
-  if (terrain === 'coast') {
-    return 'rgba(116, 170, 193, 0.8)';
+  if (tile.terrain === 'coast' || tile.terrain === 'river_valley') {
+    return themeMode === 'light' ? '#5e84ac' : '#5179a6';
   }
-  return 'rgba(241, 227, 208, 0.2)';
+  return themeMode === 'light' ? '#5f6d7b' : '#303743';
+}
+
+function drawLabel(
+  context: CanvasRenderingContext2D,
+  placement: ReturnType<typeof placeMapLabels>[number],
+  palette: MapPalette,
+) {
+  context.fillStyle = placement.kind === 'region' ? palette.labelRegionFill : palette.labelTileFill;
+  context.strokeStyle = placement.kind === 'region' ? palette.labelRegionStroke : palette.labelTileStroke;
+  context.lineWidth = 1;
+  context.fillRect(placement.x, placement.y, placement.width, placement.height);
+  context.strokeRect(placement.x, placement.y, placement.width, placement.height);
+
+  context.textAlign = 'left';
+  context.textBaseline = 'top';
+  context.fillStyle = placement.kind === 'region' ? palette.labelRegionText : palette.labelTileText;
+  context.font = placement.kind === 'region'
+    ? '600 13px "Aptos", "Segoe UI Variable Text", sans-serif'
+    : '600 11px "Aptos", "Segoe UI Variable Text", sans-serif';
+  context.fillText(placement.text, placement.x + 8, placement.y + 6);
+
+  if (placement.detail) {
+    context.fillStyle = palette.labelDetail;
+    context.font = '11px "Aptos", "Segoe UI Variable Text", sans-serif';
+    context.fillText(placement.detail, placement.x + 8, placement.y + 19);
+  }
 }
 
 export function MapCanvas({
@@ -96,6 +190,7 @@ export function MapCanvas({
   showRoutes,
   showLabels,
   showPressure,
+  themeMode,
   onSelectTile,
   onHoverTile,
 }: MapCanvasProps) {
@@ -110,12 +205,14 @@ export function MapCanvas({
       return;
     }
 
-    const update = () => {
-      const rect = element.getBoundingClientRect();
-      setSize({
-        width: Math.max(420, Math.round(rect.width)),
-        height: Math.max(420, Math.round(rect.height)),
-      });
+    const update = (width = element.clientWidth, height = element.clientHeight) => {
+      const nextWidth = Math.max(520, Math.round(width));
+      const nextHeight = Math.max(440, Math.round(height));
+      setSize((current) => (
+        current.width === nextWidth && current.height === nextHeight
+          ? current
+          : { width: nextWidth, height: nextHeight }
+      ));
     };
 
     update();
@@ -124,7 +221,13 @@ export function MapCanvas({
       return;
     }
 
-    const observer = new ResizeObserver(update);
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries.find((candidate) => candidate.target === element);
+      if (!entry) {
+        return;
+      }
+      update(entry.contentRect.width, entry.contentRect.height);
+    });
     observer.observe(element);
     return () => observer.disconnect();
   }, []);
@@ -140,54 +243,66 @@ export function MapCanvas({
       return;
     }
 
+    const palette = getPalette(themeMode);
     const devicePixelRatio = window.devicePixelRatio || 1;
-    canvas.width = size.width * devicePixelRatio;
-    canvas.height = size.height * devicePixelRatio;
-    canvas.style.width = `${size.width}px`;
-    canvas.style.height = `${size.height}px`;
+    canvas.width = Math.round(size.width * devicePixelRatio);
+    canvas.height = Math.round(size.height * devicePixelRatio);
     context.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
     context.clearRect(0, 0, size.width, size.height);
 
-    const projected = worldState.tiles.map((tile) => {
-      const x = Math.sqrt(3) * (tile.q + tile.r / 2);
-      const y = 1.5 * tile.r;
-      return { tile, x, y };
-    });
+    const layout = createMapLayout(worldState.tiles, size.width, size.height, 36);
+    const labelPlacements = showLabels
+      ? placeMapLabels(
+          worldState.tiles,
+          worldState.tribes,
+          presentation.regionLabels,
+          presentation.routeLanes,
+          layout,
+          size.width,
+          size.height,
+          selectedTileId,
+          hoveredTileId,
+        )
+      : [];
 
-    const minX = Math.min(...projected.map((entry) => entry.x));
-    const maxX = Math.max(...projected.map((entry) => entry.x));
-    const minY = Math.min(...projected.map((entry) => entry.y));
-    const maxY = Math.max(...projected.map((entry) => entry.y));
-    const widthSpan = Math.max(maxX - minX, 1);
-    const heightSpan = Math.max(maxY - minY, 1);
-    const radius = Math.min((size.width - 160) / (widthSpan + 2.6) / Math.sqrt(3), (size.height - 130) / (heightSpan + 2.4) / 2);
-    const paddingX = (size.width - widthSpan * radius * Math.sqrt(3)) / 2;
-    const paddingY = (size.height - heightSpan * radius * 1.9) / 2;
-    const centers = new Map(
-      projected.map((entry) => [
-        entry.tile.id,
-        {
-          x: paddingX + (entry.x - minX) * radius * Math.sqrt(3),
-          y: paddingY + (entry.y - minY) * radius * 1.15,
-        },
-      ]),
+    context.fillStyle = palette.canvas;
+    context.fillRect(0, 0, size.width, size.height);
+
+    context.strokeStyle = palette.grid;
+    context.lineWidth = 1;
+    for (let x = 0; x < size.width; x += 48) {
+      context.beginPath();
+      context.moveTo(x + 0.5, 0);
+      context.lineTo(x + 0.5, size.height);
+      context.stroke();
+    }
+    for (let y = 0; y < size.height; y += 48) {
+      context.beginPath();
+      context.moveTo(0, y + 0.5);
+      context.lineTo(size.width, y + 0.5);
+      context.stroke();
+    }
+
+    context.fillStyle = palette.frameFill;
+    context.fillRect(
+      layout.contentBounds.left - 18,
+      layout.contentBounds.top - 18,
+      layout.totalWidth + 36,
+      layout.totalHeight + 36,
     );
-
-    context.fillStyle = '#17140f';
-    context.fillRect(0, 0, size.width, size.height);
-
-    const gradient = context.createLinearGradient(0, 0, size.width, size.height);
-    gradient.addColorStop(0, 'rgba(233, 210, 172, 0.07)');
-    gradient.addColorStop(0.5, 'rgba(255, 255, 255, 0)');
-    gradient.addColorStop(1, 'rgba(106, 65, 39, 0.1)');
-    context.fillStyle = gradient;
-    context.fillRect(0, 0, size.width, size.height);
+    context.strokeStyle = palette.frameStroke;
+    context.strokeRect(
+      layout.contentBounds.left - 18,
+      layout.contentBounds.top - 18,
+      layout.totalWidth + 36,
+      layout.totalHeight + 36,
+    );
 
     hitAreasRef.current = [];
 
     for (const tile of worldState.tiles) {
-      const center = centers.get(tile.id)!;
-      const points = pointyHexPoints(center.x, center.y, radius);
+      const center = layout.centers.get(tile.id)!;
+      const points = createHexPoints(center, layout.radius);
       hitAreasRef.current.push({ tileId: tile.id, points });
 
       context.beginPath();
@@ -196,45 +311,45 @@ export function MapCanvas({
         context.lineTo(point.x, point.y);
       }
       context.closePath();
-      context.fillStyle = getLayerColor(tile, layerMode);
+      context.fillStyle = getLayerColor(tile, layerMode, themeMode);
       context.fill();
+
+      context.strokeStyle = terrainStroke(tile, themeMode);
+      context.lineWidth = 1.1;
+      context.stroke();
 
       if (showPressure) {
         const tribes = worldState.tribes.filter((tribe) => tribe.tileId === tile.id);
         const pressure = tribes.length
           ? tribes.reduce((sum, tribe) => sum + tribe.pressures.total, 0) / tribes.length
           : 0;
-        if (pressure > 0.55) {
-          context.save();
-          context.beginPath();
-          context.arc(center.x, center.y, radius * 0.92, 0, Math.PI * 2);
-          context.strokeStyle = `rgba(211, 90, 59, ${0.28 + pressure * 0.45})`;
-          context.lineWidth = 5;
-          context.stroke();
-          context.restore();
+        if (pressure > 0.5) {
+          context.fillStyle = pressure > 0.75 ? palette.pressureHigh : palette.pressureMedium;
+          context.fillRect(center.x - layout.radius * 0.45, center.y + layout.radius * 0.36, layout.radius * 0.9, 4);
         }
       }
 
-      context.strokeStyle = terrainStroke(tile.terrain);
-      context.lineWidth = tile.id === selectedTileId ? 4 : tile.id === hoveredTileId ? 2.5 : 1.2;
-      if (tile.id === selectedTileId) {
-        context.strokeStyle = '#f4d393';
+      if (tile.id === hoveredTileId || tile.id === selectedTileId) {
+        context.beginPath();
+        context.moveTo(points[0].x, points[0].y);
+        for (const point of points.slice(1)) {
+          context.lineTo(point.x, point.y);
+        }
+        context.closePath();
+        context.strokeStyle = tile.id === selectedTileId ? palette.selection : palette.hover;
+        context.lineWidth = tile.id === selectedTileId ? 2.6 : 2;
+        context.stroke();
       }
-      if (tile.id === hoveredTileId && tile.id !== selectedTileId) {
-        context.strokeStyle = 'rgba(255, 255, 255, 0.75)';
-      }
-      context.stroke();
     }
 
     if (showRoutes) {
       context.save();
-      context.setLineDash([8, 10]);
       context.lineWidth = 2;
-      context.strokeStyle = 'rgba(245, 210, 141, 0.75)';
+      context.strokeStyle = palette.route;
       for (const route of presentation.routeLanes) {
         context.beginPath();
         route.tileIds.forEach((tileId, index) => {
-          const center = centers.get(tileId);
+          const center = layout.centers.get(tileId);
           if (!center) {
             return;
           }
@@ -255,46 +370,37 @@ export function MapCanvas({
     }
 
     for (const [tileId, tribes] of tribesByTile) {
-      const center = centers.get(tileId)!;
+      const center = layout.centers.get(tileId)!;
+      const markerRadius = clamp(layout.radius * 0.15, 5, 8);
       tribes.forEach((tribe, index) => {
         const angle = ((index / Math.max(tribes.length, 1)) * Math.PI * 2) - Math.PI / 2;
-        const offset = tribes.length === 1 ? 0 : radius * 0.28;
+        const offset = tribes.length === 1 ? 0 : layout.radius * 0.26;
         const markerX = center.x + Math.cos(angle) * offset;
         const markerY = center.y + Math.sin(angle) * offset;
         context.beginPath();
-        context.arc(markerX, markerY, 7, 0, Math.PI * 2);
+        context.arc(markerX, markerY, markerRadius, 0, Math.PI * 2);
         context.fillStyle = tribe.color;
         context.fill();
-        context.lineWidth = tribe.statusFlags.highlighted ? 3 : 1.5;
-        context.strokeStyle = tribe.statusFlags.highlighted ? '#fff0c4' : 'rgba(24, 20, 16, 0.8)';
+        context.lineWidth = tribe.statusFlags.highlighted ? 2 : 1;
+        context.strokeStyle = palette.markerOutline;
         context.stroke();
       });
     }
 
-    context.fillStyle = 'rgba(254, 246, 232, 0.74)';
-    context.font = '12px "Palatino Linotype", Georgia, serif';
-    context.textAlign = 'center';
-    for (const tile of worldState.tiles) {
-      const center = centers.get(tile.id)!;
-      context.fillText(tile.name, center.x, center.y + radius * 0.04);
-    }
-
     if (showLabels) {
-      context.textAlign = 'left';
-      for (const label of presentation.regionLabels) {
-        const center = centers.get(label.tileId);
-        if (!center) {
-          continue;
-        }
-        context.fillStyle = 'rgba(255, 241, 217, 0.88)';
-        context.font = '600 16px "Palatino Linotype", Georgia, serif';
-        context.fillText(label.label, center.x + radius * 0.7, center.y - radius * 0.35);
-        context.fillStyle = 'rgba(255, 241, 217, 0.56)';
-        context.font = '11px "Segoe UI Variable Text", "Trebuchet MS", sans-serif';
-        context.fillText(label.detail, center.x + radius * 0.7, center.y - radius * 0.12);
+      for (const placement of labelPlacements) {
+        drawLabel(context, placement, palette);
       }
     }
-  }, [hoveredTileId, layerMode, presentation, selectedTileId, showLabels, showPressure, showRoutes, size, worldState]);
+
+    context.fillStyle = palette.stats;
+    context.font = '11px "Consolas", "SFMono-Regular", monospace';
+    context.textAlign = 'left';
+    context.textBaseline = 'top';
+    context.fillText(`LAYER ${layerMode.toUpperCase()}`, 16, 16);
+    context.fillText(`TILES ${worldState.tiles.length}`, 16, 32);
+    context.fillText(`TRIBES ${worldState.tribes.length}`, 16, 48);
+  }, [hoveredTileId, layerMode, presentation, selectedTileId, showLabels, showPressure, showRoutes, size, themeMode, worldState]);
 
   function handlePointer(event: React.PointerEvent<HTMLCanvasElement>) {
     const rect = event.currentTarget.getBoundingClientRect();

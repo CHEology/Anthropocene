@@ -1,31 +1,171 @@
-﻿import { startTransition, useEffect, useEffectEvent, useRef, useState } from 'react';
+import { startTransition, useEffect, useEffectEvent, useRef, useState } from 'react';
 
 import { DEFAULT_SIMULATION_CONFIG, cloneSimulationConfig } from '../sim/config';
-import { createSimulationEngine } from '../sim/engine';
-import type { InterventionCommand, SimulationConfig, SimulationStepResult, WorldState } from '../sim/types';
+import type {
+  InterventionCommand,
+  SimulationConfig,
+  SimulationStepResult,
+  WorldState,
+} from '../sim/types';
+import { createInitialWorldState } from '../world/oldWorld';
+import {
+  createSimulationSession,
+  deleteSimulationSession,
+  queueSimulationIntervention,
+  resetSimulationSession,
+  stepSimulationSession,
+  type SessionSnapshot,
+} from './simulationApi';
 
-export function useSimulationController(initialConfig: SimulationConfig = DEFAULT_SIMULATION_CONFIG) {
-  const engineRef = useRef(createSimulationEngine(initialConfig));
+type ConnectionState = 'connecting' | 'live' | 'error';
+
+function mergeRuntimeConfig(
+  config: SimulationConfig,
+  runtime: SimulationConfig['runtime'],
+): SimulationConfig {
+  const nextConfig = cloneSimulationConfig(config);
+  nextConfig.runtime = { ...runtime };
+  return nextConfig;
+}
+
+function toStepResult(
+  session: SessionSnapshot,
+  result: Omit<SimulationStepResult, 'state'>,
+): SimulationStepResult {
+  return {
+    ...result,
+    state: session.state,
+  };
+}
+
+export function useSimulationController(
+  initialConfig: SimulationConfig = DEFAULT_SIMULATION_CONFIG,
+) {
   const frameRef = useRef<number | null>(null);
   const elapsedRef = useRef(0);
   const previousFrameRef = useRef<number | null>(null);
+  const queueRef = useRef<Promise<unknown>>(Promise.resolve());
+  const sessionIdRef = useRef<string | null>(null);
+  const runtimeRef = useRef<SimulationConfig['runtime']>({
+    ...cloneSimulationConfig(initialConfig).runtime,
+  });
+  const busyRef = useRef(false);
+  const connectionStateRef = useRef<ConnectionState>('connecting');
+  const disposedRef = useRef(false);
+
   const [config, setConfig] = useState(() => cloneSimulationConfig(initialConfig));
-  const [worldState, setWorldState] = useState<WorldState>(() => engineRef.current.getState());
+  const [worldState, setWorldState] = useState<WorldState>(() =>
+    createInitialWorldState(initialConfig),
+  );
   const [lastStep, setLastStep] = useState<SimulationStepResult | null>(null);
   const [running, setRunning] = useState(false);
+  const [ready, setReady] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [connectionState, setConnectionState] = useState<ConnectionState>('connecting');
+  const [error, setError] = useState<string | null>(null);
 
-  const syncFromEngine = useEffectEvent((result?: SimulationStepResult) => {
-    const nextState = engineRef.current.getState();
+  const setBusyState = useEffectEvent((value: boolean) => {
+    busyRef.current = value;
     startTransition(() => {
-      setWorldState(nextState);
-      if (result) {
-        setLastStep(result);
+      setSyncing(value);
+    });
+  });
+
+  const setConnectionStateValue = useEffectEvent((value: ConnectionState) => {
+    connectionStateRef.current = value;
+    startTransition(() => {
+      setConnectionState(value);
+    });
+  });
+
+  const syncFromSession = useEffectEvent(
+    (
+      session: SessionSnapshot,
+      result?: Omit<SimulationStepResult, 'state'>,
+      syncConfig = false,
+    ) => {
+      sessionIdRef.current = session.id;
+      const nextConfig = mergeRuntimeConfig(session.config, runtimeRef.current);
+      startTransition(() => {
+        if (syncConfig) {
+          setConfig(nextConfig);
+        }
+        setWorldState(session.state);
+        setReady(true);
+        setError(null);
+        setConnectionState('live');
+        if (result) {
+          setLastStep(toStepResult(session, result));
+        }
+      });
+      connectionStateRef.current = 'live';
+    },
+  );
+
+  const failRequest = useEffectEvent((requestError: unknown) => {
+    const message = requestError instanceof Error ? requestError.message : 'Backend request failed.';
+    startTransition(() => {
+      setRunning(false);
+      setError(message);
+      setConnectionState('error');
+    });
+    connectionStateRef.current = 'error';
+  });
+
+  function enqueueRequest<T>(task: () => Promise<T>) {
+    const scheduled = queueRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        if (disposedRef.current) {
+          return undefined;
+        }
+
+        setBusyState(true);
+        try {
+          return await task();
+        } finally {
+          if (!disposedRef.current) {
+            setBusyState(false);
+          }
+        }
+      });
+
+    queueRef.current = scheduled.catch(() => undefined);
+    return scheduled.catch((requestError) => {
+      if (!disposedRef.current) {
+        failRequest(requestError);
       }
+      return undefined;
+    });
+  }
+
+  const bootstrapSession = useEffectEvent((nextConfig: SimulationConfig) => {
+    runtimeRef.current = { ...nextConfig.runtime };
+    setConnectionStateValue('connecting');
+    startTransition(() => {
+      setError(null);
+      setLastStep(null);
+    });
+
+    return enqueueRequest(async () => {
+      const response = await createSimulationSession(nextConfig);
+      if (!disposedRef.current) {
+        syncFromSession(response.session, undefined, true);
+      }
+      return response.session;
     });
   });
 
   const advanceFrame = useEffectEvent((deltaMs: number) => {
-    const yearsPerSecond = Math.max(config.runtime.yearsPerSecond, 1);
+    if (
+      !sessionIdRef.current ||
+      busyRef.current ||
+      connectionStateRef.current !== 'live'
+    ) {
+      return;
+    }
+
+    const yearsPerSecond = Math.max(runtimeRef.current.yearsPerSecond, 1);
     const millisecondsPerYear = 1000 / yearsPerSecond;
     elapsedRef.current += deltaMs;
     const yearsToAdvance = Math.min(64, Math.floor(elapsedRef.current / millisecondsPerYear));
@@ -35,9 +175,28 @@ export function useSimulationController(initialConfig: SimulationConfig = DEFAUL
     }
 
     elapsedRef.current -= yearsToAdvance * millisecondsPerYear;
-    const result = engineRef.current.step(yearsToAdvance);
-    syncFromEngine(result);
+    void step(yearsToAdvance);
   });
+
+  useEffect(() => {
+    disposedRef.current = false;
+    void bootstrapSession(cloneSimulationConfig(initialConfig));
+
+    return () => {
+      disposedRef.current = true;
+      if (frameRef.current !== null) {
+        cancelAnimationFrame(frameRef.current);
+      }
+      frameRef.current = null;
+      previousFrameRef.current = null;
+      elapsedRef.current = 0;
+      const sessionId = sessionIdRef.current;
+      sessionIdRef.current = null;
+      if (sessionId) {
+        void deleteSimulationSession(sessionId).catch(() => undefined);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (!running) {
@@ -74,47 +233,92 @@ export function useSimulationController(initialConfig: SimulationConfig = DEFAUL
   }, [running]);
 
   function step(years = 1) {
-    const result = engineRef.current.step(years);
-    syncFromEngine(result);
-    return result;
+    return enqueueRequest(async () => {
+      const sessionId = sessionIdRef.current;
+      if (!sessionId) {
+        throw new Error('No backend simulation session is available. Reset to reconnect.');
+      }
+
+      const response = await stepSimulationSession(sessionId, years);
+      if (!disposedRef.current) {
+        syncFromSession(response.session, response.result);
+      }
+      return toStepResult(response.session, response.result);
+    });
   }
 
   function reset(nextConfig = config) {
     const cloned = cloneSimulationConfig(nextConfig);
-    engineRef.current = createSimulationEngine(cloned);
-    setConfig(cloned);
+    runtimeRef.current = { ...cloned.runtime };
     setRunning(false);
-    setLastStep(null);
+    setConnectionStateValue('connecting');
     startTransition(() => {
-      setWorldState(engineRef.current.getState());
+      setError(null);
+      setLastStep(null);
+    });
+
+    return enqueueRequest(async () => {
+      const sessionId = sessionIdRef.current;
+      if (!sessionId) {
+        const response = await createSimulationSession(cloned);
+        if (!disposedRef.current) {
+          syncFromSession(response.session, undefined, true);
+        }
+        return response.session.state;
+      }
+
+      const response = await resetSimulationSession(sessionId, cloned);
+      if (!disposedRef.current) {
+        syncFromSession(response.session, undefined, true);
+      }
+      return response.session.state;
     });
   }
 
   function toggleRunning() {
+    if (connectionStateRef.current !== 'live' || !sessionIdRef.current) {
+      return;
+    }
+
     setRunning((value) => !value);
   }
 
   function updateRuntimeSpeed(yearsPerSecond: number) {
-    const nextConfig = {
-      ...config,
+    runtimeRef.current = {
+      ...runtimeRef.current,
+      yearsPerSecond,
+    };
+    setConfig((current) => ({
+      ...current,
       runtime: {
-        ...config.runtime,
+        ...current.runtime,
         yearsPerSecond,
       },
-    };
-    engineRef.current.setRuntimeSpeed(yearsPerSecond);
-    setConfig(nextConfig);
+    }));
   }
 
   function scheduleIntervention(command: InterventionCommand) {
-    engineRef.current.enqueueIntervention(command);
-    syncFromEngine();
+    return enqueueRequest(async () => {
+      const sessionId = sessionIdRef.current;
+      if (!sessionId) {
+        throw new Error('No backend simulation session is available. Reset to reconnect.');
+      }
+
+      const response = await queueSimulationIntervention(sessionId, command);
+      if (!disposedRef.current) {
+        syncFromSession(response.session);
+      }
+    });
   }
 
   return {
     config,
     worldState,
     running,
+    ready,
+    syncing,
+    connectionState,
+    error,
     lastStep,
     setRunning,
     toggleRunning,

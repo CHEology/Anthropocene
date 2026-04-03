@@ -11,24 +11,27 @@ Object.defineProperty(globalThis, 'ResizeObserver', {
   writable: true,
 });
 
-Object.defineProperty(HTMLCanvasElement.prototype, 'getContext', {
-  value: () => ({
-    beginPath() {},
-    moveTo() {},
-    lineTo() {},
-    closePath() {},
-    fill() {},
-    stroke() {},
-    clearRect() {},
-    fillRect() {},
-    createLinearGradient() {
-      return { addColorStop() {} };
-    },
-    setTransform() {},
-    arc() {},
-    save() {},
-    restore() {},
-    fillText() {},
-    setLineDash() {},
-  }),
-});
+if (typeof HTMLCanvasElement !== 'undefined') {
+  Object.defineProperty(HTMLCanvasElement.prototype, 'getContext', {
+    value: () => ({
+      beginPath() {},
+      moveTo() {},
+      lineTo() {},
+      closePath() {},
+      fill() {},
+      stroke() {},
+      strokeRect() {},
+      clearRect() {},
+      fillRect() {},
+      createLinearGradient() {
+        return { addColorStop() {} };
+      },
+      setTransform() {},
+      arc() {},
+      save() {},
+      restore() {},
+      fillText() {},
+      setLineDash() {},
+    }),
+  });
+}

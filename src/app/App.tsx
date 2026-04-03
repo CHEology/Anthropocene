@@ -1,19 +1,14 @@
-﻿import { useDeferredValue, useEffect, useState } from 'react';
+﻿import { useDeferredValue, useEffect, useRef, useState, type CSSProperties } from 'react';
 
+import { DEFAULT_SIMULATION_CONFIG, cloneSimulationConfig } from '../sim/config';
+import type { InterventionCommand, SimulationConfig, TribeState } from '../sim/types';
+import { getWorldPresentation } from '../world/oldWorld';
 import { MapCanvas } from './components/MapCanvas';
 import { useSimulationController } from './useSimulationController';
-import { DEFAULT_SIMULATION_CONFIG, cloneSimulationConfig } from '../sim/config';
-import { getWorldPresentation } from '../world/oldWorld';
-import type {
-  InterventionCommand,
-  SimulationConfig,
-  TribeState,
-  WorldMetrics,
-  WorldState,
-} from '../sim/types';
 
 type LayerMode = 'comfort' | 'habitability' | 'water' | 'temperature';
 type InspectorTab = 'overview' | 'tile' | 'tribe' | 'pressures' | 'relations' | 'events';
+type ThemeMode = 'dark' | 'light';
 
 type InterventionDraft = {
   kind: InterventionCommand['kind'];
@@ -22,6 +17,41 @@ type InterventionDraft = {
   duration: number;
   note: string;
 };
+
+const ABILITY_LABELS: Record<string, string> = {
+  foraging: 'Foraging',
+  agriculture: 'Agriculture',
+  heatTolerance: 'Heat Tolerance',
+  coldTolerance: 'Cold Tolerance',
+  waterEngineering: 'Water Engineering',
+  attack: 'Attack',
+  organization: 'Organization',
+};
+
+const LAYER_LABELS: Record<LayerMode, string> = {
+  comfort: 'Comfort',
+  habitability: 'Habitability',
+  water: 'Water',
+  temperature: 'Temperature',
+};
+
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function getInitialTheme(): ThemeMode {
+  if (typeof window === 'undefined') {
+    return 'dark';
+  }
+
+  const savedTheme = window.localStorage.getItem('anthropocene-theme');
+  if (savedTheme === 'dark' || savedTheme === 'light') {
+    return savedTheme;
+  }
+
+  return window.matchMedia?.('(prefers-color-scheme: light)')?.matches ? 'light' : 'dark';
+}
 
 function formatSigned(value: number, digits = 1) {
   const rounded = value.toFixed(digits);
@@ -66,7 +96,7 @@ function ChartCard({
       <div className="chart-card__label">{label}</div>
       <div className="chart-card__value">{formatMetric(value)}</div>
       <svg className="chart-card__sparkline" viewBox="0 0 180 56" preserveAspectRatio="none">
-        <polyline fill="none" stroke={color} strokeWidth="3" points={sparklinePoints(history, 180, 56)} />
+        <polyline fill="none" stroke={color} strokeWidth="2.5" points={sparklinePoints(history, 180, 56)} />
       </svg>
     </article>
   );
@@ -108,8 +138,8 @@ function SliderField({
 function MetricChip({ label, value }: { label: string; value: string }) {
   return (
     <div className="metric-chip">
-      <span>{label}</span>
-      <strong>{value}</strong>
+      <span className="metric-chip__label">{label}</span>
+      <strong className="metric-chip__value">{value}</strong>
     </div>
   );
 }
@@ -124,7 +154,7 @@ function AbilityRows({ tribe }: { tribe: TribeState | null }) {
       {Object.entries(tribe.abilities).map(([ability, value]) => (
         <div className="bar-row" key={ability}>
           <div className="bar-row__meta">
-            <span>{ability}</span>
+            <span>{ABILITY_LABELS[ability] ?? ability}</span>
             <strong>
               {Math.round(value.current)} / {Math.round(value.cap)}
             </strong>
@@ -170,76 +200,158 @@ function PressureRows({ tribe }: { tribe: TribeState | null }) {
   );
 }
 
-function buildCommandId(worldState: WorldState) {
-  return `cmd-${worldState.year}-${worldState.pendingInterventions.length + worldState.executedInterventions.length + 1}`;
+function buildCommandId(worldYear: number, pending: number, executed: number) {
+  return `cmd-${worldYear}-${pending + executed + 1}`;
 }
 
 export function App() {
   const controller = useSimulationController(DEFAULT_SIMULATION_CONFIG);
   const [draftConfig, setDraftConfig] = useState<SimulationConfig>(() => cloneSimulationConfig(DEFAULT_SIMULATION_CONFIG));
+  const [themeMode, setThemeMode] = useState<ThemeMode>(getInitialTheme);
   const [layerMode, setLayerMode] = useState<LayerMode>('comfort');
   const [showRoutes, setShowRoutes] = useState(true);
   const [showLabels, setShowLabels] = useState(true);
   const [showPressure, setShowPressure] = useState(true);
   const [leftRailOpen, setLeftRailOpen] = useState(false);
   const [rightRailOpen, setRightRailOpen] = useState(false);
+  const [rightRailMinimized, setRightRailMinimized] = useState(false);
+  const [rightRailWidth, setRightRailWidth] = useState(392);
+  const [resizingRightRail, setResizingRightRail] = useState(false);
   const [interventionOpen, setInterventionOpen] = useState(false);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('overview');
   const presentation = getWorldPresentation(controller.worldState.worldPreset);
   const [selectedTileId, setSelectedTileId] = useState<string | null>(presentation.startTileId);
   const [selectedTribeId, setSelectedTribeId] = useState<string | null>(presentation.startTribeId);
   const [hoveredTileId, setHoveredTileId] = useState<string | null>(null);
+  const rightRailResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const [interventionDraft, setInterventionDraft] = useState<InterventionDraft>({
     kind: 'climate-pulse',
     scheduledYear: 80,
     temperatureDelta: -1.2,
     duration: 140,
-    note: 'Mark a major inflection for later slices.',
+    note: 'Schedule climate disturbance for replayable analysis.',
   });
 
   const deferredWorldState = useDeferredValue(controller.worldState);
-  const selectedTile = deferredWorldState.tiles.find((tile) => tile.id === selectedTileId) ?? null;
-  const selectedTribe = deferredWorldState.tribes.find((tribe) => tribe.id === selectedTribeId) ?? null;
+  const liveWorldState = controller.worldState;
+  const controlsDisabled = controller.connectionState !== 'live';
+  const selectedTile = liveWorldState.tiles.find((tile) => tile.id === selectedTileId) ?? null;
+  const selectedTribe = liveWorldState.tribes.find((tribe) => tribe.id === selectedTribeId) ?? null;
   const tribesOnSelectedTile = selectedTile
-    ? deferredWorldState.tribes.filter((tribe) => tribe.tileId === selectedTile.id)
+    ? liveWorldState.tribes.filter((tribe) => tribe.tileId === selectedTile.id)
     : [];
+  const tribeNameById = new Map(liveWorldState.tribes.map((tribe) => [tribe.id, tribe.name]));
 
   useEffect(() => {
     setDraftConfig(cloneSimulationConfig(controller.config));
   }, [controller.config]);
 
   useEffect(() => {
-    if (!deferredWorldState.tiles.some((tile) => tile.id === selectedTileId)) {
+    document.documentElement.dataset.theme = themeMode;
+    document.documentElement.style.colorScheme = themeMode;
+    window.localStorage.setItem('anthropocene-theme', themeMode);
+  }, [themeMode]);
+
+  useEffect(() => {
+    if (!liveWorldState.tiles.some((tile) => tile.id === selectedTileId)) {
       setSelectedTileId(presentation.startTileId);
     }
-  }, [deferredWorldState.tiles, presentation.startTileId, selectedTileId]);
+  }, [liveWorldState.tiles, presentation.startTileId, selectedTileId]);
 
   useEffect(() => {
-    if (!deferredWorldState.tribes.some((tribe) => tribe.id === selectedTribeId)) {
-      setSelectedTribeId(deferredWorldState.tribes[0]?.id ?? null);
+    if (selectedTribeId && !liveWorldState.tribes.some((tribe) => tribe.id === selectedTribeId)) {
+      setSelectedTribeId(null);
     }
-  }, [deferredWorldState.tribes, selectedTribeId]);
+  }, [liveWorldState.tribes, selectedTribeId]);
 
   useEffect(() => {
-    if (selectedTile) {
-      const tribeOnTile = deferredWorldState.tribes.find((tribe) => tribe.tileId === selectedTile.id);
-      if (tribeOnTile && !selectedTribe) {
-        setSelectedTribeId(tribeOnTile.id);
+    if (!selectedTileId) {
+      return;
+    }
+
+    const tribeOnTile = liveWorldState.tribes.find((tribe) => tribe.tileId === selectedTileId) ?? null;
+    const tribeSelectionIsValid = Boolean(
+      selectedTribeId && liveWorldState.tribes.some((tribe) => tribe.id === selectedTribeId && tribe.tileId === selectedTileId),
+    );
+
+    if (!tribeSelectionIsValid) {
+      setSelectedTribeId(tribeOnTile?.id ?? null);
+    }
+  }, [liveWorldState.tribes, selectedTileId, selectedTribeId]);
+
+  useEffect(() => {
+    if (!selectedTribe || inspectorTab === 'tile') {
+      return;
+    }
+
+    if (selectedTileId !== selectedTribe.tileId) {
+      setSelectedTileId(selectedTribe.tileId);
+    }
+  }, [inspectorTab, selectedTileId, selectedTribe]);
+
+  useEffect(() => {
+    if (!resizingRightRail) {
+      return;
+    }
+
+    const handlePointerMove = (event: PointerEvent) => {
+      const current = rightRailResizeRef.current;
+      if (!current) {
+        return;
       }
-    }
-  }, [deferredWorldState.tribes, selectedTile, selectedTribe]);
+
+      const delta = current.startX - event.clientX;
+      setRightRailWidth(clamp(current.startWidth + delta, 300, 620));
+    };
+
+    const stopResize = () => {
+      rightRailResizeRef.current = null;
+      setResizingRightRail(false);
+    };
+
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', stopResize);
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', stopResize);
+    };
+  }, [resizingRightRail]);
 
   function handleTileSelect(tileId: string) {
+    const tribeOnTile = liveWorldState.tribes.find((tribe) => tribe.tileId === tileId) ?? null;
     setSelectedTileId(tileId);
-    const tribeOnTile = deferredWorldState.tribes.find((tribe) => tribe.tileId === tileId);
-    if (tribeOnTile) {
-      setSelectedTribeId(tribeOnTile.id);
-    }
+    setSelectedTribeId(tribeOnTile?.id ?? null);
+    setInspectorTab('tile');
+    setRightRailMinimized(false);
     setRightRailOpen(true);
   }
 
+  function handleTribeSelect(tribeId: string) {
+    const tribe = liveWorldState.tribes.find((candidate) => candidate.id === tribeId) ?? null;
+    setSelectedTribeId(tribeId);
+    if (tribe) {
+      setSelectedTileId(tribe.tileId);
+    }
+    setInspectorTab('tribe');
+    setRightRailMinimized(false);
+    setRightRailOpen(true);
+  }
+
+  function beginRightRailResize(event: React.PointerEvent<HTMLDivElement>) {
+    if (rightRailMinimized || window.matchMedia('(max-width: 1380px)').matches) {
+      return;
+    }
+
+    rightRailResizeRef.current = {
+      startX: event.clientX,
+      startWidth: rightRailWidth,
+    };
+    setResizingRightRail(true);
+    event.preventDefault();
+  }
+
   function handleReset() {
-    controller.reset(draftConfig);
+    void controller.reset(draftConfig);
     setSelectedTileId(presentation.startTileId);
     setSelectedTribeId(presentation.startTribeId);
   }
@@ -257,7 +369,11 @@ export function App() {
 
   function scheduleIntervention() {
     const command: InterventionCommand = {
-      id: buildCommandId(controller.worldState),
+      id: buildCommandId(
+        controller.worldState.year,
+        controller.worldState.pendingInterventions.length,
+        controller.worldState.executedInterventions.length,
+      ),
       label:
         interventionDraft.kind === 'climate-pulse'
           ? `Climate Pulse ${formatSigned(interventionDraft.temperatureDelta)}°C`
@@ -275,7 +391,7 @@ export function App() {
               note: interventionDraft.note,
             },
     };
-    controller.scheduleIntervention(command);
+    void controller.scheduleIntervention(command);
     setInterventionOpen(false);
   }
 
@@ -289,19 +405,31 @@ export function App() {
     : [];
 
   return (
-    <div className="app-shell">
+    <div
+      className="app-shell"
+      style={{ ['--right-rail-width' as string]: rightRailMinimized ? '72px' : `${rightRailWidth}px` } as CSSProperties}
+    >
       <header className="topbar panel-surface">
         <div className="title-block">
-          <p className="eyebrow">Out of Eden Research Console</p>
+          <p className="eyebrow">Migration Analysis Console</p>
           <h1>Anthropocene Simulator</h1>
-          <p className="title-block__summary">Hybrid intervention sandbox for emergent early-human migration dynamics.</p>
+          <p className="title-block__summary">
+            Deterministic world-state dashboard for early-human migration modeling. {controller.connectionState === 'live' ? 'Backend connected.' : controller.connectionState === 'connecting' ? 'Connecting to backend...' : `Backend error: ${controller.error ?? 'Unavailable.'}`}
+          </p>
+          <div className="metric-grid metric-grid--topbar">
+            <MetricChip label="Year" value={`${deferredWorldState.year}`} />
+            <MetricChip label="Population" value={`${deferredWorldState.metrics.totalPopulation}`} />
+            <MetricChip label="Climate" value={`${deferredWorldState.globalClimate.meanTemperature.toFixed(1)}°C`} />
+            <MetricChip label="Queued" value={`${deferredWorldState.pendingInterventions.length}`} />
+            <MetricChip label="Backend" value={controller.connectionState === 'live' ? (controller.syncing ? 'Syncing' : 'Live') : controller.connectionState === 'connecting' ? 'Connecting' : 'Error'} />
+          </div>
         </div>
 
         <div className="topbar__controls">
-          <button className="button button--primary" onClick={controller.toggleRunning}>
+          <button className="button button--primary" disabled={controlsDisabled} onClick={controller.toggleRunning}>
             {controller.running ? 'Pause' : 'Run'}
           </button>
-          <button className="button" onClick={() => controller.step(1)}>Step 1y</button>
+          <button className="button" disabled={controlsDisabled || controller.syncing} onClick={() => void controller.step(1)}>Step 1y</button>
           <label className="compact-field">
             <span>Speed</span>
             <select value={controller.config.runtime.yearsPerSecond} onChange={(event) => handleSpeedChange(Number(event.target.value))}>
@@ -310,10 +438,6 @@ export function App() {
               ))}
             </select>
           </label>
-          <div className="year-readout">
-            <span>Year</span>
-            <strong>{deferredWorldState.year}</strong>
-          </div>
           <label className="compact-field compact-field--seed">
             <span>Seed</span>
             <input
@@ -328,8 +452,11 @@ export function App() {
               <option value="old-world-corridor">Old World Corridor</option>
             </select>
           </label>
-          <button className="button" onClick={handleReset}>Reset World</button>
-          <button className="button" onClick={() => setInterventionOpen((value) => !value)}>Interventions</button>
+          <button className="button" disabled={controller.syncing} onClick={handleReset}>Reset</button>
+          <button className="button" onClick={() => setThemeMode((current) => (current === 'dark' ? 'light' : 'dark'))}>
+            Theme: {themeMode === 'dark' ? 'Dark' : 'Light'}
+          </button>
+          <button className="button" disabled={controlsDisabled} onClick={() => setInterventionOpen((value) => !value)}>Interventions</button>
           <button className="button button--ghost mobile-only" onClick={() => setLeftRailOpen((value) => !value)}>Controls</button>
           <button className="button button--ghost mobile-only" onClick={() => setRightRailOpen((value) => !value)}>Inspector</button>
         </div>
@@ -339,21 +466,21 @@ export function App() {
         <section className="panel-section">
           <div className="section-heading">
             <h2>Scenario</h2>
-            <p>{presentation.description}</p>
+            <p>Operational summary for the authored Afro-Eurasian corridor.</p>
           </div>
           <div className="metric-grid">
+            <MetricChip label="Start Tile" value="Rift Cradle" />
+            <MetricChip label="Routes" value={`${presentation.routeLanes.length}`} />
             <MetricChip label="Active Climate" value={`${deferredWorldState.globalClimate.meanTemperature.toFixed(1)}°C`} />
             <MetricChip label="Anomaly" value={`${formatSigned(activePulse)}°C`} />
-            <MetricChip label="Pending Commands" value={`${deferredWorldState.pendingInterventions.length}`} />
-            <MetricChip label="Last Step" value={controller.lastStep ? `${controller.lastStep.nextYear}` : 'Idle'} />
           </div>
-          <p className="aside-note">Global parameter edits remain in draft until you hit <strong>Reset World</strong>.</p>
+          <p className="aside-note">Draft parameters apply on reset. Runtime controls remain deterministic for a fixed seed.</p>
         </section>
 
         <section className="panel-section">
           <div className="section-heading">
             <h2>Global Parameters</h2>
-            <p>Slice 1 exposes the PDF baselines and reserves runtime mutation for later systems.</p>
+            <p>Baseline controls from the PDF specification.</p>
           </div>
           <SliderField label="Birth (G_birth)" value={draftConfig.globals.G_birth} min={0.01} max={0.08} step={0.001} onChange={(value) => setDraftConfig((current) => ({ ...current, globals: { ...current.globals, G_birth: value } }))} />
           <SliderField label="Death (G_death)" value={draftConfig.globals.G_death} min={0.01} max={0.08} step={0.001} onChange={(value) => setDraftConfig((current) => ({ ...current, globals: { ...current.globals, G_death: value } }))} />
@@ -367,19 +494,19 @@ export function App() {
         <section className="panel-section">
           <div className="section-heading">
             <h2>Map Layers</h2>
-            <p>Use comfort, habitability, water, and temperature layers to spot route tension.</p>
+            <p>Analytical overlays for terrain suitability and stress.</p>
           </div>
           <div className="toggle-cluster">
             {(['comfort', 'habitability', 'water', 'temperature'] as LayerMode[]).map((mode) => (
               <button key={mode} className={`toggle-pill ${layerMode === mode ? 'is-active' : ''}`} onClick={() => setLayerMode(mode)}>
-                {mode}
+                {LAYER_LABELS[mode]}
               </button>
             ))}
           </div>
           <div className="checkbox-list">
-            <label><input type="checkbox" checked={showRoutes} onChange={(event) => setShowRoutes(event.target.checked)} /> Migration corridors</label>
-            <label><input type="checkbox" checked={showLabels} onChange={(event) => setShowLabels(event.target.checked)} /> Region labels</label>
-            <label><input type="checkbox" checked={showPressure} onChange={(event) => setShowPressure(event.target.checked)} /> Pressure hotspots</label>
+            <label><input type="checkbox" checked={showRoutes} onChange={(event) => setShowRoutes(event.target.checked)} /> Corridor lanes</label>
+            <label><input type="checkbox" checked={showLabels} onChange={(event) => setShowLabels(event.target.checked)} /> Controlled labels</label>
+            <label><input type="checkbox" checked={showPressure} onChange={(event) => setShowPressure(event.target.checked)} /> Pressure markers</label>
           </div>
         </section>
       </aside>
@@ -387,11 +514,12 @@ export function App() {
       <main className="map-stage panel-surface">
         <div className="map-stage__header">
           <div>
-            <p className="eyebrow">World Field</p>
+            <p className="eyebrow">World Map</p>
             <h2>{presentation.name}</h2>
           </div>
           <div className="map-stage__stats">
-            <MetricChip label="Population" value={`${deferredWorldState.metrics.totalPopulation}`} />
+            <MetricChip label="Tiles" value={`${deferredWorldState.tiles.length}`} />
+            <MetricChip label="Tribes" value={`${deferredWorldState.metrics.tribeCount}`} />
             <MetricChip label="Avg Comfort" value={deferredWorldState.metrics.averageComfort.toFixed(2)} />
             <MetricChip label="Avg Pressure" value={deferredWorldState.metrics.averagePressure.toFixed(2)} />
           </div>
@@ -406,21 +534,36 @@ export function App() {
           showLabels={showLabels}
           showPressure={showPressure}
           showRoutes={showRoutes}
+          themeMode={themeMode}
           worldState={deferredWorldState}
         />
         <div className="map-stage__footer">
           <div>
             <strong>{selectedTile?.name ?? 'No tile selected'}</strong>
-            <span>{selectedTile ? `${selectedTile.region} • ${selectedTile.climate} • ${selectedTile.terrain}` : 'Click a hex to inspect it.'}</span>
+            <span>{selectedTile ? `${selectedTile.region} • ${selectedTile.climate} • ${selectedTile.terrain}` : 'Click a hex to inspect tile state.'}</span>
           </div>
           <div>
-            <strong>{hoveredTileId ? 'Hovering' : 'Selection'}</strong>
-            <span>{hoveredTileId ?? selectedTileId ?? '—'}</span>
+            <strong>{selectedTribe?.name ?? 'No tribe selected'}</strong>
+            <span>{selectedTribe ? `${selectedTribe.pop} people • ${selectedTribe.leader?.archetype ?? 'No leader'}` : 'Use the map or tile panel to select a tribe.'}</span>
           </div>
         </div>
       </main>
 
-      <aside className={`side-rail side-rail--right panel-surface ${rightRailOpen ? 'is-open' : ''}`}>
+      <aside className={`side-rail side-rail--right panel-surface ${rightRailOpen ? 'is-open' : ''} ${rightRailMinimized ? 'is-minimized' : ''}`}>
+        <div className={`side-rail__resize-handle ${resizingRightRail ? 'is-active' : ''}`} onPointerDown={beginRightRailResize} />
+        <div className="rail-header">
+          <div className="rail-header__title">
+            <p className="eyebrow">Inspector</p>
+            <strong>{selectedTile?.name ?? selectedTribe?.name ?? 'Selection'}</strong>
+          </div>
+          <div className="rail-header__actions">
+            <button className="button button--ghost" onClick={() => setRightRailMinimized((value) => !value)}>
+              {rightRailMinimized ? 'Expand' : 'Minimize'}
+            </button>
+          </div>
+        </div>
+        {!rightRailMinimized && (
+          <>
         <div className="tabs">
           {(['overview', 'tile', 'tribe', 'pressures', 'relations', 'events'] as InspectorTab[]).map((tab) => (
             <button key={tab} className={`tab-button ${inspectorTab === tab ? 'is-active' : ''}`} onClick={() => setInspectorTab(tab)}>
@@ -434,13 +577,13 @@ export function App() {
             <>
               <div className="section-heading">
                 <h2>Overview</h2>
-                <p>High-signal snapshot of the current scaffolded world state.</p>
+                <p>Current simulation state and active shell instrumentation.</p>
               </div>
               <div className="metric-grid">
-                <MetricChip label="Tribes" value={`${deferredWorldState.metrics.tribeCount}`} />
                 <MetricChip label="Innovations" value={`${deferredWorldState.metrics.innovations}`} />
-                <MetricChip label="Conflicts" value={`${deferredWorldState.metrics.conflicts}`} />
-                <MetricChip label="Commands Applied" value={`${deferredWorldState.executedInterventions.length}`} />
+                <MetricChip label="Conflict Alerts" value={`${deferredWorldState.metrics.conflicts}`} />
+                <MetricChip label="Executed Cmds" value={`${deferredWorldState.executedInterventions.length}`} />
+                <MetricChip label="Tick Status" value={controller.running ? 'Running' : controller.connectionState === 'connecting' ? 'Connecting' : controller.connectionState === 'error' ? 'Offline' : 'Paused'} />
               </div>
               <AbilityRows tribe={selectedTribe} />
             </>
@@ -468,7 +611,7 @@ export function App() {
                 <h3>Resident Tribes</h3>
                 <div className="list-stack">
                   {tribesOnSelectedTile.length ? tribesOnSelectedTile.map((tribe) => (
-                    <button key={tribe.id} className={`list-row ${selectedTribeId === tribe.id ? 'is-active' : ''}`} onClick={() => { setSelectedTribeId(tribe.id); setInspectorTab('tribe'); }}>
+                    <button key={tribe.id} className={`list-row ${selectedTribeId === tribe.id ? 'is-active' : ''}`} onClick={() => handleTribeSelect(tribe.id)}>
                       <span>{tribe.name}</span>
                       <strong>{tribe.pop}</strong>
                     </button>
@@ -482,7 +625,7 @@ export function App() {
             <>
               <div className="section-heading">
                 <h2>{selectedTribe?.name ?? 'Tribe'}</h2>
-                <p>{selectedTribe ? `${selectedTribe.pop} people • ${selectedTribe.leader?.archetype ?? 'No leader'} leader archetype` : 'Choose a tribe from the tile panel.'}</p>
+                <p>{selectedTribe ? `${selectedTribe.pop} people • ${selectedTribe.leader?.archetype ?? 'No leader'} archetype` : 'Choose a tribe from the tile panel.'}</p>
               </div>
               {selectedTribe ? (
                 <div className="detail-grid">
@@ -500,7 +643,7 @@ export function App() {
             <>
               <div className="section-heading">
                 <h2>Pressures</h2>
-                <p>Slice 1 pressure proxies already drive innovation and migration scaffolding.</p>
+                <p>Pressure proxies driving migration and innovation scaffolding.</p>
               </div>
               <PressureRows tribe={selectedTribe} />
             </>
@@ -510,12 +653,12 @@ export function App() {
             <>
               <div className="section-heading">
                 <h2>Relations</h2>
-                <p>Relationship maps are seeded now and will matter more in later diplomacy slices.</p>
+                <p>Seeded relationship edges for later diplomacy and trade systems.</p>
               </div>
               <div className="list-stack">
                 {relations.length ? relations.map(([tribeId, value]) => (
                   <div className="list-row" key={tribeId}>
-                    <span>{tribeId}</span>
+                    <span>{tribeNameById.get(tribeId) ?? tribeId}</span>
                     <strong>{value.toFixed(2)}</strong>
                   </div>
                 )) : <div className="empty-state">No relationship edges are available for the selected tribe.</div>}
@@ -527,7 +670,7 @@ export function App() {
             <>
               <div className="section-heading">
                 <h2>Event Feed</h2>
-                <p>System, innovation, migration, and intervention entries are replayable from seed + command sequence.</p>
+                <p>Replayable event chronology derived from seed + intervention sequence.</p>
               </div>
               <div className="event-stack">
                 {deferredWorldState.eventLog.map((event) => (
@@ -544,19 +687,21 @@ export function App() {
             </>
           )}
         </div>
+          </>
+        )}
       </aside>
 
       <section className="timeline-strip panel-surface">
         <div className="timeline-strip__charts">
-          <ChartCard label="Population" value={deferredWorldState.metrics.totalPopulation} color="#f0be6f" history={history.map((entry) => entry.totalPopulation)} />
-          <ChartCard label="Tribe Count" value={deferredWorldState.metrics.tribeCount} color="#82c7c1" history={history.map((entry) => entry.tribeCount)} />
-          <ChartCard label="Innovations" value={deferredWorldState.metrics.innovations} color="#d6de8a" history={history.map((entry) => entry.innovations)} />
-          <ChartCard label="Conflict Alerts" value={deferredWorldState.metrics.conflicts} color="#d17a52" history={history.map((entry) => entry.conflicts)} />
+          <ChartCard label="Population" value={deferredWorldState.metrics.totalPopulation} color="#d0d5dd" history={history.map((entry) => entry.totalPopulation)} />
+          <ChartCard label="Tribe Count" value={deferredWorldState.metrics.tribeCount} color="#7aa2c8" history={history.map((entry) => entry.tribeCount)} />
+          <ChartCard label="Innovations" value={deferredWorldState.metrics.innovations} color="#7e9f74" history={history.map((entry) => entry.innovations)} />
+          <ChartCard label="Conflict Alerts" value={deferredWorldState.metrics.conflicts} color="#ba6a4a" history={history.map((entry) => entry.conflicts)} />
         </div>
         <div className="timeline-strip__events">
           <div className="section-heading">
             <h2>Chronology</h2>
-            <p>Newest simulation entries stay pinned here while the detailed feed remains in the inspector.</p>
+            <p>Recent simulation entries pinned for operational review.</p>
           </div>
           <div className="list-stack list-stack--compact">
             {deferredWorldState.eventLog.slice(0, 8).map((event) => (
@@ -572,7 +717,7 @@ export function App() {
       <aside className={`drawer panel-surface ${interventionOpen ? 'is-open' : ''}`}>
         <div className="section-heading">
           <h2>Intervention Drawer</h2>
-          <p>Slice 1 only schedules replayable high-level commands. Later slices will attach richer effects.</p>
+          <p>Queue deterministic high-level commands for replay and comparison.</p>
         </div>
         <label className="compact-field compact-field--full">
           <span>Mode</span>
@@ -602,7 +747,7 @@ export function App() {
           <textarea rows={4} value={interventionDraft.note} onChange={(event) => setInterventionDraft((current) => ({ ...current, note: event.target.value }))} />
         </label>
         <div className="drawer__actions">
-          <button className="button button--primary" onClick={scheduleIntervention}>Queue Command</button>
+          <button className="button button--primary" disabled={controlsDisabled || controller.syncing} onClick={scheduleIntervention}>Queue Command</button>
           <button className="button" onClick={() => setInterventionOpen(false)}>Close</button>
         </div>
         <div className="subsection">
@@ -620,3 +765,4 @@ export function App() {
     </div>
   );
 }
+

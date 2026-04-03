@@ -8,7 +8,7 @@
   TribeState,
   WorldPresentation,
   WorldState,
-} from '../sim/types';
+} from '../sim/types.js';
 
 interface TileSeed {
   id: string;

@@ -4,9 +4,13 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "typecheck": "tsc --noEmit",
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "start": "npm run build && npm run server:start",
+    "build": "npm run typecheck && npm run server:build && vite build",
     "preview": "vite preview",
+    "server:build": "tsc -p tsconfig.server.json",
+    "server:start": "node dist-server/server/index.js",
     "test": "vitest"
   },
   "dependencies": {
@@ -22,6 +26,7 @@
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^14.6.1",
+    "@types/node": "^25.5.0",
     "jsdom": "^29.0.1",
     "vitest": "^4.1.2"
   }
