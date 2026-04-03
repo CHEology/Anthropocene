@@ -209,9 +209,9 @@ function applyTilePhase(read: WorldState, write: WorldState, changedTileIds: Set
   for (const tile of write.tiles) {
     const previous = previousTiles.get(tile.id)!;
     const totalPopulation = occupancy.get(tile.id) ?? 0;
-    const totalFoodCapacity =
-      previous.carryingCapacity.hunt + previous.carryingCapacity.agri;
-    const occupancyRatio = totalPopulation / Math.max(totalFoodCapacity, 1);
+    const baselineFoodCapacity =
+      previous.baseCarryingCapacity.hunt + previous.baseCarryingCapacity.agri;
+    const crowdingRatio = totalPopulation / Math.max(baselineFoodCapacity, 1);
     const climateShift = Math.abs(write.globalClimate.meanTemperature - TARGET_BASELINE_TEMPERATURE);
     const climateStress = clamp(Math.max(0, climateShift - 1.5) / 8, 0, 0.45);
     const terrainPenalty =
@@ -224,8 +224,6 @@ function applyTilePhase(read: WorldState, write: WorldState, changedTileIds: Set
       previous.baseCarryingCapacity.agri * 0.012,
       previous.baseCarryingCapacity.agri - previous.carryingCapacity.agri,
     );
-    const huntOvershoot = Math.max(0, occupancyRatio - 0.78);
-    const agriOvershoot = Math.max(0, occupancyRatio - 0.9);
 
     tile.temperature = round(
       tile.baseTemperature + (write.globalClimate.meanTemperature - TARGET_BASELINE_TEMPERATURE),
@@ -233,8 +231,7 @@ function applyTilePhase(read: WorldState, write: WorldState, changedTileIds: Set
     );
     tile.carryingCapacity.hunt = round(
       clamp(
-        previous.carryingCapacity.hunt * (1 - huntOvershoot * 0.18 - climateStress * 0.05) +
-          huntRecovery,
+        previous.carryingCapacity.hunt * (1 - climateStress * 0.05) + huntRecovery,
         previous.baseCarryingCapacity.hunt > 0 ? previous.baseCarryingCapacity.hunt * 0.18 : 0,
         previous.baseCarryingCapacity.hunt,
       ),
@@ -242,8 +239,7 @@ function applyTilePhase(read: WorldState, write: WorldState, changedTileIds: Set
     );
     tile.carryingCapacity.agri = round(
       clamp(
-        previous.carryingCapacity.agri * (1 - agriOvershoot * 0.1 - climateStress * 0.03) +
-          agriRecovery,
+        previous.carryingCapacity.agri * (1 - climateStress * 0.03) + agriRecovery,
         previous.baseCarryingCapacity.agri > 0 ? previous.baseCarryingCapacity.agri * 0.25 : 0,
         previous.baseCarryingCapacity.agri,
       ),
@@ -262,7 +258,7 @@ function applyTilePhase(read: WorldState, write: WorldState, changedTileIds: Set
         tile.baseComfort -
           climateShift * 0.08 -
           terrainPenalty -
-          Math.max(0, occupancyRatio - 0.7) * 1.75 -
+          Math.max(0, crowdingRatio - 0.74) * 1.35 -
           climateStress * 0.75,
         0.2,
         6,
@@ -281,7 +277,6 @@ function applyTilePhase(read: WorldState, write: WorldState, changedTileIds: Set
     }
   }
 }
-
 interface TribeResourceContext {
   effectiveForaging: number;
   effectiveFarming: number;
@@ -299,11 +294,11 @@ function computeTribeResourceContext(
   const safeTilePopulation = Math.max(tilePopulation, tribe.pop, 1);
   const share = clamp(tribe.pop / safeTilePopulation, 0.08, 1);
   const effectiveForaging = round(
-    tile.carryingCapacity.hunt * share * (0.55 + tribe.abilities.foraging.current / 95),
+    tile.carryingCapacity.hunt * share * (0.40 + tribe.abilities.foraging.current / 55),
     2,
   );
   const effectiveFarming = round(
-    tile.carryingCapacity.agri * share * (tribe.abilities.agriculture.current / 105),
+    tile.carryingCapacity.agri * share * (tribe.abilities.agriculture.current / 70),
     2,
   );
   const effectiveFood = round(effectiveForaging + effectiveFarming, 2);
@@ -335,8 +330,8 @@ function computeTribeResourceContext(
   const carryingCapacity = round(
     clamp(
       Math.min(effectiveFood, supportedByWater) +
-        tile.comfort * 11 +
-        tribe.abilities.organization.current * 0.4,
+        tile.comfort * 16 +
+        tribe.abilities.organization.current * 0.7,
       MIN_TRIBE_POPULATION * 2,
       MAX_TRIBE_POPULATION,
     ),
@@ -414,6 +409,7 @@ function applyTribePhase(
   const writeTribeMap = tribesById(write);
   const writeTileMap = tilesById(write);
   const occupancy = occupancyByTile(read);
+  const tileLoads = new Map<string, { foraging: number; farming: number }>();
   const orderedIds = shuffleIds(
     read.tribes.map((tribe) => tribe.id),
     prng,
@@ -423,7 +419,6 @@ function applyTribePhase(
     const source = readTribeMap.get(tribeId)!;
     const target = writeTribeMap.get(tribeId)!;
     const tile = readTileMap.get(source.tileId)!;
-    const writeTile = writeTileMap.get(source.tileId)!;
     const previousPop = target.pop;
 
     target.statusFlags.migrating = false;
@@ -434,6 +429,10 @@ function applyTribePhase(
       tile,
       occupancy.get(source.tileId) ?? source.pop,
     );
+    const existingTileLoad = tileLoads.get(source.tileId) ?? { foraging: 0, farming: 0 };
+    existingTileLoad.foraging += resourceContext.effectiveForaging;
+    existingTileLoad.farming += resourceContext.effectiveFarming;
+    tileLoads.set(source.tileId, existingTileLoad);
     const nextPressures = resourceContext.pressures;
     target.pressures = nextPressures;
 
@@ -470,15 +469,15 @@ function applyTribePhase(
     }
 
     const carryingCapacity = resourceContext.carryingCapacity;
-    const densityPressure = clamp(source.pop / Math.max(carryingCapacity, 1) - 0.84, 0, 1.4);
+    const densityPressure = clamp(source.pop / Math.max(carryingCapacity, 1) - 0.88, 0, 1.4);
     const foodMultiplier = clamp(1 - nextPressures.food * 0.8, 0.08, 1.2);
     const comfortMultiplier = clamp(1 - (nextPressures.heat + nextPressures.cold) * 0.3, 0.5, 1.1);
     const orgMultiplier = 1 + target.abilities.organization.current * 0.005;
     const densityMultiplier = clamp(1 - densityPressure * 0.7, 0.05, 1.05);
     const favorableGrowthBonus = clamp(
-      (carryingCapacity / Math.max(source.pop, 1) - 1) * 0.02,
+      (carryingCapacity / Math.max(source.pop, 1) - 1) * 0.035,
       0,
-      0.009,
+      0.012,
     );
     const birthRate = clamp(
       (config.globals.G_birth + favorableGrowthBonus) *
@@ -516,16 +515,27 @@ function applyTribePhase(
     target.pop = clamp(source.pop + netWhole, 0, MAX_TRIBE_POPULATION);
     target.statusFlags.recovering = target.pop > source.pop;
 
-    const foragingShare = clamp(0.85 - target.abilities.agriculture.current / 120, 0.22, 0.95);
-    const foragingLoad = source.pop * foragingShare;
-    const farmingLoad =
-      source.pop * (1 - foragingShare) * (0.6 + target.abilities.agriculture.current / 140);
+    if (target.pop !== previousPop || target.pressures.total !== source.pressures.total) {
+      changedTribeIds.add(target.id);
+    }
+  }
+
+  for (const [tileId, load] of tileLoads) {
+    const tile = readTileMap.get(tileId);
+    const writeTile = writeTileMap.get(tileId);
+    if (!tile || !writeTile) {
+      continue;
+    }
+
+    const huntPressure = load.foraging / Math.max(tile.carryingCapacity.hunt, 1);
+    const agriPressure = load.farming / Math.max(tile.carryingCapacity.agri, 1);
     const huntDepletion =
-      foragingLoad * 0.022 +
-      Math.max(0, foragingLoad - tile.carryingCapacity.hunt * 0.8) * 0.08;
+      load.foraging * 0.005 +
+      Math.max(0, huntPressure - 1) * tile.carryingCapacity.hunt * 0.01;
     const agriDepletion =
-      farmingLoad * 0.018 +
-      Math.max(0, farmingLoad - tile.carryingCapacity.agri * 0.88) * 0.06;
+      load.farming * 0.004 +
+      Math.max(0, agriPressure - 1) * tile.carryingCapacity.agri * 0.008;
+
     writeTile.carryingCapacity.hunt = round(
       clamp(
         writeTile.carryingCapacity.hunt - huntDepletion,
@@ -542,13 +552,8 @@ function applyTribePhase(
       ),
       2,
     );
-
-    if (target.pop !== previousPop || target.pressures.total !== source.pressures.total) {
-      changedTribeIds.add(target.id);
-    }
   }
 }
-
 function applyInteractionPhase(read: WorldState, events: SimulationEvent[]) {
   const grouped = new Map<string, TribeState[]>();
   for (const tribe of read.tribes) {
@@ -598,10 +603,12 @@ function applyMigrationPhase(
     }
 
     const currentTile = readTiles.get(tribe.tileId)!;
+    const currentOccupancy = (occupancy.get(currentTile.id) ?? 0) / 120;
     const currentScore =
       currentTile.comfort * 2.4 +
       currentTile.water * 0.9 +
-      (currentTile.carryingCapacity.hunt + currentTile.carryingCapacity.agri) / 95;
+      (currentTile.carryingCapacity.hunt + currentTile.carryingCapacity.agri) / 95 -
+      currentOccupancy * 2.1;
 
     let bestTile = currentTile;
     let bestScore = currentScore;
@@ -613,7 +620,7 @@ function applyMigrationPhase(
         neighbor.comfort * 2.4 +
         neighbor.water * 0.9 +
         (neighbor.carryingCapacity.hunt + neighbor.carryingCapacity.agri) / 95 -
-        occupancyPenalty * 1.2 -
+        occupancyPenalty * 2.1 -
         (neighbor.terrain === 'desert' ? 1.6 : 0);
 
       if (score > bestScore) {
@@ -630,9 +637,11 @@ function applyMigrationPhase(
       0.85,
     );
 
+    const opportunityThreshold = Math.max(0.15 - migrationPressure * 5.0, -3.0);
+
     if (
       bestTile.id !== currentTile.id &&
-      opportunity > 0.15 &&
+      opportunity > opportunityThreshold &&
       prng.next() < migrationChance
     ) {
       const target = writeTribes.get(tribe.id)!;
@@ -907,4 +916,8 @@ export function createSimulationEngine(initialConfig: SimulationConfig): Simulat
     },
   };
 }
+
+
+
+
 

@@ -78,4 +78,35 @@ describe('simulation engine', () => {
     expect(Math.max(...tribeCounts)).toBeGreaterThan(initial.metrics.tribeCount);
     expect(engine.getState().metrics.totalPopulation).not.toBe(initial.metrics.totalPopulation);
   });
+
+  it('maintains long-run population growth without collapsing occupied tiles into resource floors', { timeout: 15_000 }, () => {
+    const config = cloneSimulationConfig(DEFAULT_SIMULATION_CONFIG);
+    config.seed = 12045;
+
+    const engine = createSimulationEngine(config);
+    const initial = engine.getState();
+    const visitedTiles = new Set(initial.tribes.map((tribe) => tribe.tileId));
+
+    for (let index = 0; index < 1200; index += 1) {
+      const result = engine.step(1);
+      for (const tribe of result.state.tribes) {
+        visitedTiles.add(tribe.tileId);
+      }
+    }
+
+    const state = engine.getState();
+    const occupiedTileIds = new Set(state.tribes.map((tribe) => tribe.tileId));
+    const occupiedHuntRatios = state.tiles
+      .filter((tile) => occupiedTileIds.has(tile.id))
+      .map((tile) => tile.carryingCapacity.hunt / Math.max(tile.baseCarryingCapacity.hunt, 1));
+    const averageOccupiedHuntRatio =
+      occupiedHuntRatios.reduce((sum, ratio) => sum + ratio, 0) /
+      Math.max(occupiedHuntRatios.length, 1);
+
+    expect(state.metrics.totalPopulation).toBeGreaterThan(initial.metrics.totalPopulation * 2);
+    expect(visitedTiles.has('levant-corridor')).toBe(true);
+    expect(averageOccupiedHuntRatio).toBeGreaterThan(0.75);
+  });
 });
+
+
