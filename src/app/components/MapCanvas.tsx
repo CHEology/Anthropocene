@@ -43,6 +43,11 @@ interface MapPalette {
   selection: string;
   hover: string;
   markerOutline: string;
+  allianceHalo: string;
+  hazardDisaster: string;
+  hazardDisease: string;
+  hazardCrisis: string;
+  megafaunaTrace: string;
   stats: string;
 }
 
@@ -76,6 +81,11 @@ function getPalette(themeMode: ThemeMode): MapPalette {
       selection: '#16212d',
       hover: '#5d7387',
       markerOutline: '#ffffff',
+      allianceHalo: '#6e8f63',
+      hazardDisaster: '#bf6545',
+      hazardDisease: '#6d93b7',
+      hazardCrisis: '#ba6a4a',
+      megafaunaTrace: '#b88b4b',
       stats: '#5c6d7e',
     };
   }
@@ -98,6 +108,11 @@ function getPalette(themeMode: ThemeMode): MapPalette {
     selection: '#f2f5f8',
     hover: '#8ba1b7',
     markerOutline: '#0f141a',
+    allianceHalo: '#89a97e',
+    hazardDisaster: '#bf5f3c',
+    hazardDisease: '#7aa2c8',
+    hazardCrisis: '#d28d69',
+    megafaunaTrace: '#d0a15d',
     stats: '#9ba6b2',
   };
 }
@@ -329,6 +344,33 @@ export function MapCanvas({
         }
       }
 
+      if (tile.activeDisasters.length) {
+        context.fillStyle = palette.hazardDisaster;
+        context.fillRect(center.x - layout.radius * 0.54, center.y - layout.radius * 0.48, 8, 8);
+      }
+      if (tile.activePlagues.length) {
+        context.beginPath();
+        context.arc(center.x - layout.radius * 0.34, center.y - layout.radius * 0.44, 4.5, 0, Math.PI * 2);
+        context.fillStyle = palette.hazardDisease;
+        context.fill();
+      }
+
+      if ((tile.id === hoveredTileId || tile.id === selectedTileId) && tile.megafaunaIndex > 0.08) {
+        context.beginPath();
+        context.arc(center.x + layout.radius * 0.28, center.y - layout.radius * 0.34, 5.5, 0, Math.PI * 2);
+        context.strokeStyle = palette.megafaunaTrace;
+        context.lineWidth = 1.6;
+        context.stroke();
+      }
+
+      if ((tile.id === hoveredTileId || tile.id === selectedTileId) && (tile.activeDisasters.length || tile.activePlagues.length)) {
+        context.beginPath();
+        context.arc(center.x, center.y, layout.radius * 0.26, 0, Math.PI * 2);
+        context.strokeStyle = palette.hazardCrisis;
+        context.lineWidth = 1.4;
+        context.stroke();
+      }
+
       if (tile.id === hoveredTileId || tile.id === selectedTileId) {
         context.beginPath();
         context.moveTo(points[0].x, points[0].y);
@@ -377,6 +419,13 @@ export function MapCanvas({
         const offset = tribes.length === 1 ? 0 : layout.radius * 0.26;
         const markerX = center.x + Math.cos(angle) * offset;
         const markerY = center.y + Math.sin(angle) * offset;
+        if (tribe.alliances.length) {
+          context.beginPath();
+          context.arc(markerX, markerY, markerRadius + 1.8, 0, Math.PI * 2);
+          context.strokeStyle = palette.allianceHalo;
+          context.lineWidth = 1.4;
+          context.stroke();
+        }
         context.beginPath();
         context.arc(markerX, markerY, markerRadius, 0, Math.PI * 2);
         context.fillStyle = tribe.color;

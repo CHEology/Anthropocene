@@ -1,8 +1,8 @@
 ﻿import { useDeferredValue, useEffect, useRef, useState, type CSSProperties } from 'react';
 
 import { DEFAULT_SIMULATION_CONFIG, cloneSimulationConfig } from '../sim/config';
-import type { InterventionCommand, SimulationConfig, TribeState } from '../sim/types';
-import { getWorldPresentation } from '../world/oldWorld';
+import type { InterventionCommand, SimulationConfig, SimulationEvent, TribeState } from '../sim/types';
+import { getWorldPresentation, WORLD_PRESET_OPTIONS } from '../world/oldWorld';
 import { MapCanvas } from './components/MapCanvas';
 import { useSimulationController } from './useSimulationController';
 
@@ -35,6 +35,58 @@ const LAYER_LABELS: Record<LayerMode, string> = {
   temperature: 'Temperature',
 };
 
+const AGRICULTURE_STAGE_LABELS: Record<TribeState['development']['agricultureStage'], string> = {
+  foraging: 'Foraging',
+  tending: 'Tending',
+  cultivation: 'Cultivation',
+  agropastoral: 'Agropastoral',
+  'settled-farming': 'Settled Farming',
+};
+
+const DISASTER_LABELS: Record<string, string> = {
+  drought: 'Drought',
+  flood: 'Flood',
+  wildfire: 'Wildfire',
+  'severe-winter': 'Severe Winter',
+  earthquake: 'Earthquake',
+  eruption: 'Eruption',
+};
+
+const PLAGUE_LABELS: Record<string, string> = {
+  waterborne: 'Waterborne',
+  respiratory: 'Respiratory',
+  zoonotic: 'Zoonotic',
+};
+
+const EVENT_KIND_LABELS: Record<SimulationEvent['kind'], string> = {
+  system: 'System',
+  intervention: 'Intervention',
+  innovation: 'Innovation',
+  migration: 'Migration',
+  warning: 'Warning',
+  combat: 'Combat',
+  trade: 'Trade',
+  diplomacy: 'Diplomacy',
+  disaster: 'Disaster',
+  disease: 'Disease',
+};
+
+const CLIMATE_REGIME_LABELS: Record<string, string> = {
+  'deep-glacial': 'Deep Glacial',
+  glacial: 'Glacial',
+  'cool-transition': 'Cool Transition',
+  'temperate-window': 'Temperate Window',
+  'warm-pulse': 'Warm Pulse',
+  'volcanic-winter': 'Volcanic Winter',
+};
+
+const STORYTELLER_POSTURE_LABELS: Record<string, string> = {
+  quiet: 'Quiet',
+  balanced: 'Balanced',
+  prosperity: 'Prosperity',
+  recovery: 'Recovery',
+  crisis: 'Crisis',
+};
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
@@ -60,6 +112,47 @@ function formatSigned(value: number, digits = 1) {
 
 function formatMetric(value: number, digits = 2) {
   return Number.isInteger(value) ? String(value) : value.toFixed(digits);
+}
+
+function formatPercent(value: number) {
+  return `${Math.round(value * 100)}%`;
+}
+
+function formatStage(stage: TribeState['development']['agricultureStage']) {
+  return AGRICULTURE_STAGE_LABELS[stage] ?? stage;
+}
+
+function formatClimateRegime(regime: string) {
+  return CLIMATE_REGIME_LABELS[regime] ?? regime;
+}
+
+function formatStorytellerPosture(posture: string) {
+  return STORYTELLER_POSTURE_LABELS[posture] ?? posture;
+}
+
+function formatElevation(value: number) {
+  return `${Math.round(value)} m`;
+}
+
+function formatViability(tribe: TribeState) {
+  const strain =
+    tribe.pressures.total * 0.42 +
+    tribe.pressures.food * 0.22 +
+    tribe.pressures.health * 0.12 +
+    Math.max(0, 0.4 - tribe.foodStores) * 0.14 +
+    (1 - tribe.geneticDiversity) * 0.1 -
+    tribe.development.sedentism * 0.05;
+
+  if (strain < 0.18) {
+    return 'Expanding';
+  }
+  if (strain < 0.36) {
+    return 'Stable';
+  }
+  if (strain < 0.58) {
+    return 'Strained';
+  }
+  return 'Fragile';
 }
 
 function sparklinePoints(values: number[], width: number, height: number) {
@@ -144,6 +237,25 @@ function MetricChip({ label, value }: { label: string; value: string }) {
   );
 }
 
+function StatusChip({ label, tone = 'default' }: { label: string; tone?: 'default' | 'danger' | 'info' | 'success' }) {
+  return <span className={`status-chip status-chip--${tone}`}>{label}</span>;
+}
+
+function ChronologyEntry({ event }: { event: SimulationEvent }) {
+  const title = event.detail ? `${event.title} - ${event.detail}` : event.title;
+
+  return (
+    <article className={`chronology-entry chronology-entry--${event.kind}`} title={title}>
+      <div className="chronology-entry__body">
+        <span className="chronology-entry__kind">{EVENT_KIND_LABELS[event.kind] ?? event.kind}</span>
+        <strong className="chronology-entry__title">{event.title}</strong>
+        {event.detail ? <span className="chronology-entry__detail">{event.detail}</span> : null}
+      </div>
+      <strong className="chronology-entry__year">Y{event.year}</strong>
+    </article>
+  );
+}
+
 function AbilityRows({ tribe }: { tribe: TribeState | null }) {
   if (!tribe) {
     return <div className="empty-state">Select a tribe to inspect abilities.</div>;
@@ -180,6 +292,7 @@ function PressureRows({ tribe }: { tribe: TribeState | null }) {
     ['Water', tribe.pressures.water],
     ['Competition', tribe.pressures.competition],
     ['Organization', tribe.pressures.organization],
+    ['Health', tribe.pressures.health],
     ['Total', tribe.pressures.total],
   ] as const;
 
@@ -220,6 +333,7 @@ export function App() {
   const [interventionOpen, setInterventionOpen] = useState(false);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('overview');
   const presentation = getWorldPresentation(controller.worldState.worldPreset);
+  const draftPresentation = getWorldPresentation(draftConfig.worldPreset);
   const [selectedTileId, setSelectedTileId] = useState<string | null>(presentation.startTileId);
   const [selectedTribeId, setSelectedTribeId] = useState<string | null>(presentation.startTribeId);
   const [hoveredTileId, setHoveredTileId] = useState<string | null>(null);
@@ -352,8 +466,21 @@ export function App() {
 
   function handleReset() {
     void controller.reset(draftConfig);
-    setSelectedTileId(presentation.startTileId);
-    setSelectedTribeId(presentation.startTribeId);
+    setSelectedTileId(draftPresentation.startTileId);
+    setSelectedTribeId(draftPresentation.startTribeId);
+  }
+
+  function handlePresetChange(nextPreset: SimulationConfig['worldPreset']) {
+    const nextConfig = {
+      ...draftConfig,
+      worldPreset: nextPreset,
+    };
+    const nextPresentation = getWorldPresentation(nextPreset);
+
+    setDraftConfig(nextConfig);
+    setSelectedTileId(nextPresentation.startTileId);
+    setSelectedTribeId(nextPresentation.startTribeId);
+    void controller.reset(nextConfig);
   }
 
   function handleSpeedChange(nextValue: number) {
@@ -403,6 +530,17 @@ export function App() {
   const relations = selectedTribe
     ? Object.entries(selectedTribe.relationships).sort((left, right) => right[1] - left[1])
     : [];
+  const activeDisasterCount = deferredWorldState.metrics.activeHazards;
+  const activePlagueCount = deferredWorldState.metrics.activePlagues;
+  const allianceCount = deferredWorldState.tribes.reduce((sum, tribe) => sum + tribe.alliances.length, 0) / 2;
+  const selectedTileDisasters = selectedTile?.activeDisasters ?? [];
+  const selectedTilePlagues = selectedTile?.activePlagues ?? [];
+  const selectedTribeAllies = selectedTribe
+    ? selectedTribe.alliances.map((allianceId) => tribeNameById.get(allianceId) ?? allianceId)
+    : [];
+  const climateStatus = formatClimateRegime(deferredWorldState.globalClimate.regime);
+  const storytellerStatus = formatStorytellerPosture(deferredWorldState.storyteller.posture);
+  const selectedTribeViability = selectedTribe ? formatViability(selectedTribe) : null;
 
   return (
     <div
@@ -419,9 +557,9 @@ export function App() {
           <div className="metric-grid metric-grid--topbar">
             <MetricChip label="Year" value={`${deferredWorldState.year}`} />
             <MetricChip label="Population" value={`${deferredWorldState.metrics.totalPopulation}`} />
-            <MetricChip label="Climate" value={`${deferredWorldState.globalClimate.meanTemperature.toFixed(1)}°C`} />
+            <MetricChip label="Climate Regime" value={climateStatus} />
             <MetricChip label="Queued" value={`${deferredWorldState.pendingInterventions.length}`} />
-            <MetricChip label="Backend" value={controller.connectionState === 'live' ? (controller.syncing ? 'Syncing' : 'Live') : controller.connectionState === 'connecting' ? 'Connecting' : 'Error'} />
+            <MetricChip label="Backend" value={controller.connectionState === 'live' ? 'Live' : controller.connectionState === 'connecting' ? 'Connecting' : 'Error'} />
           </div>
         </div>
 
@@ -448,8 +586,10 @@ export function App() {
           </label>
           <label className="compact-field compact-field--preset">
             <span>Preset</span>
-            <select value={draftConfig.worldPreset} onChange={(event) => setDraftConfig((current) => ({ ...current, worldPreset: event.target.value as SimulationConfig['worldPreset'] }))}>
-              <option value="old-world-corridor">Old World Corridor</option>
+            <select value={draftConfig.worldPreset} onChange={(event) => handlePresetChange(event.target.value as SimulationConfig['worldPreset'])}>
+              {WORLD_PRESET_OPTIONS.map((preset) => (
+                <option key={preset.id} value={preset.id}>{preset.label}</option>
+              ))}
             </select>
           </label>
           <button className="button" disabled={controller.syncing} onClick={handleReset}>Reset</button>
@@ -466,15 +606,15 @@ export function App() {
         <section className="panel-section">
           <div className="section-heading">
             <h2>Scenario</h2>
-            <p>Operational summary for the authored Afro-Eurasian corridor.</p>
+            <p>{draftPresentation.description}</p>
           </div>
           <div className="metric-grid">
-            <MetricChip label="Start Tile" value="Rift Cradle" />
-            <MetricChip label="Routes" value={`${presentation.routeLanes.length}`} />
-            <MetricChip label="Active Climate" value={`${deferredWorldState.globalClimate.meanTemperature.toFixed(1)}°C`} />
+            <MetricChip label="Start Tile" value={draftPresentation.startTileName} />
+            <MetricChip label="Routes" value={`${draftPresentation.routeLanes.length}`} />
+            <MetricChip label="Climate Regime" value={climateStatus} />
             <MetricChip label="Anomaly" value={`${formatSigned(activePulse)}°C`} />
           </div>
-          <p className="aside-note">Draft parameters apply on reset. Runtime controls remain deterministic for a fixed seed.</p>
+          <p className="aside-note">Preset changes apply immediately. Other draft parameters apply on reset. Runtime controls remain deterministic for a fixed seed.</p>
         </section>
 
         <section className="panel-section">
@@ -535,12 +675,12 @@ export function App() {
           showPressure={showPressure}
           showRoutes={showRoutes}
           themeMode={themeMode}
-          worldState={deferredWorldState}
+          worldState={liveWorldState}
         />
         <div className="map-stage__footer">
           <div>
             <strong>{selectedTile?.name ?? 'No tile selected'}</strong>
-            <span>{selectedTile ? `${selectedTile.region} • ${selectedTile.climate} • ${selectedTile.terrain}` : 'Click a hex to inspect tile state.'}</span>
+            <span>{selectedTile ? `${selectedTile.region} | ${selectedTile.climate} | ${selectedTile.coastal ? 'coastal' : 'inland'} | ${selectedTile.terrain}` : 'Click a hex to inspect tile state.'}</span>
           </div>
           <div>
             <strong>{selectedTribe?.name ?? 'No tribe selected'}</strong>
@@ -559,6 +699,9 @@ export function App() {
           <div className="rail-header__actions">
             <button className="button button--ghost" onClick={() => setRightRailMinimized((value) => !value)}>
               {rightRailMinimized ? 'Expand' : 'Minimize'}
+            </button>
+            <button className="button button--ghost" onClick={() => { setRightRailOpen(false); setRightRailMinimized(false); }}>
+              Close
             </button>
           </div>
         </div>
@@ -582,8 +725,21 @@ export function App() {
               <div className="metric-grid">
                 <MetricChip label="Innovations" value={`${deferredWorldState.metrics.innovations}`} />
                 <MetricChip label="Conflict Alerts" value={`${deferredWorldState.metrics.conflicts}`} />
-                <MetricChip label="Executed Cmds" value={`${deferredWorldState.executedInterventions.length}`} />
+                <MetricChip label="Active Hazards" value={`${activeDisasterCount}`} />
+                <MetricChip label="Active Plagues" value={`${activePlagueCount}`} />
+                <MetricChip label="Avg Stores" value={formatPercent(deferredWorldState.metrics.averageFoodStores)} />
+                <MetricChip label="Avg Diversity" value={formatPercent(deferredWorldState.metrics.averageGeneticDiversity)} />
+                <MetricChip label="Avg Megafauna" value={formatPercent(deferredWorldState.metrics.averageMegafauna)} />
                 <MetricChip label="Tick Status" value={controller.running ? 'Running' : controller.connectionState === 'connecting' ? 'Connecting' : controller.connectionState === 'error' ? 'Offline' : 'Paused'} />
+              </div>
+              <div className="subsection">
+                <h3>Climate and Pacing</h3>
+                <div className="detail-list">
+                  <div className="detail-row"><span>Climate Regime</span><strong>{climateStatus}</strong></div>
+                  <div className="detail-row"><span>Storyteller</span><strong>{storytellerStatus}</strong></div>
+                  <div className="detail-row"><span>Prosperity</span><strong>{formatPercent(deferredWorldState.storyteller.prosperity)}</strong></div>
+                  <div className="detail-row"><span>Disaster / Recovery</span><strong>{`${deferredWorldState.storyteller.disasterMultiplier.toFixed(2)} / ${deferredWorldState.storyteller.recoveryMultiplier.toFixed(2)}`}</strong></div>
+                </div>
               </div>
               <AbilityRows tribe={selectedTribe} />
             </>
@@ -593,20 +749,32 @@ export function App() {
             <>
               <div className="section-heading">
                 <h2>{selectedTile?.name ?? 'Tile'}</h2>
-                <p>{selectedTile ? `${selectedTile.region} • ${selectedTile.climate}` : 'Choose a tile from the map.'}</p>
+                <p>{selectedTile ? `${selectedTile.region} | ${selectedTile.climate} | ${selectedTile.coastal ? 'coastal' : 'inland'}` : 'Choose a tile from the map.'}</p>
               </div>
               {selectedTile ? (
                 <div className="detail-grid">
                   <MetricChip label="Comfort" value={selectedTile.comfort.toFixed(2)} />
                   <MetricChip label="Temp" value={`${selectedTile.temperature.toFixed(1)}°C`} />
                   <MetricChip label="Water" value={`${selectedTile.water}`} />
+                  <MetricChip label="Elevation" value={formatElevation(selectedTile.elevation)} />
+                  <MetricChip label="Megafauna" value={formatPercent(selectedTile.megafaunaIndex)} />
+                  <MetricChip label="Coastal" value={selectedTile.coastal ? 'Yes' : 'No'} />
                   <MetricChip label="Hunt K" value={selectedTile.carryingCapacity.hunt.toFixed(0)} />
                   <MetricChip label="Agri K" value={selectedTile.carryingCapacity.agri.toFixed(0)} />
+                  <MetricChip label="Water K" value={selectedTile.carryingCapacity.water.toFixed(0)} />
                   <MetricChip label="Neighbors" value={`${selectedTile.neighbors.length}`} />
                 </div>
               ) : (
                 <div className="empty-state">No tile selected.</div>
               )}
+              <div className="subsection">
+                <h3>Hazards and Ecology</h3>
+                <div className="detail-list">
+                  <div className="detail-row"><span>Climate Regime</span><strong>{climateStatus}</strong></div>
+                  <div className="detail-row"><span>Active Disasters</span><strong>{selectedTileDisasters.length ? selectedTileDisasters.map((disaster) => DISASTER_LABELS[disaster.kind] ?? disaster.kind).join(', ') : 'None'}</strong></div>
+                  <div className="detail-row"><span>Active Plagues</span><strong>{selectedTilePlagues.length ? selectedTilePlagues.map((plague) => PLAGUE_LABELS[plague.kind] ?? plague.kind).join(', ') : 'None'}</strong></div>
+                </div>
+              </div>
               <div className="subsection">
                 <h3>Resident Tribes</h3>
                 <div className="list-stack">
@@ -628,12 +796,45 @@ export function App() {
                 <p>{selectedTribe ? `${selectedTribe.pop} people • ${selectedTribe.leader?.archetype ?? 'No leader'} archetype` : 'Choose a tribe from the tile panel.'}</p>
               </div>
               {selectedTribe ? (
-                <div className="detail-grid">
-                  <MetricChip label="Population" value={`${selectedTribe.pop}`} />
-                  <MetricChip label="Tile" value={selectedTribe.tileId} />
-                  <MetricChip label="Ancestry" value={selectedTribe.ancestryId} />
-                  <MetricChip label="Leader" value={selectedTribe.leader?.name ?? 'Vacant'} />
-                </div>
+                <>
+                  <div className="detail-grid">
+                    <MetricChip label="Population" value={`${selectedTribe.pop}`} />
+                    <MetricChip label="Stage" value={formatStage(selectedTribe.development.agricultureStage)} />
+                    <MetricChip label="Sedentism" value={formatPercent(selectedTribe.development.sedentism)} />
+                    <MetricChip label="Domestication" value={selectedTribe.development.domestication.toFixed(1)} />
+                    <MetricChip label="Food Stores" value={formatPercent(selectedTribe.foodStores)} />
+                    <MetricChip label="Genetic" value={formatPercent(selectedTribe.geneticDiversity)} />
+                    <MetricChip label="Viability" value={selectedTribeViability ?? 'Unknown'} />
+                    <MetricChip label="Trade" value={selectedTribe.exchange.tradeVolume.toFixed(2)} />
+                    <MetricChip label="War Wear" value={selectedTribe.exchange.warExhaustion.toFixed(2)} />
+                    <MetricChip label="Allies" value={`${selectedTribe.alliances.length}`} />
+                  </div>
+                  <div className="subsection">
+                    <h3>Leader State</h3>
+                    <div className="detail-list">
+                      <div className="detail-row"><span>Archetype</span><strong>{selectedTribe.leader?.archetype ?? 'Vacant'}</strong></div>
+                      <div className="detail-row"><span>Authority</span><strong>{selectedTribe.leader ? formatPercent(selectedTribe.leader.authority) : '0%'}</strong></div>
+                      <div className="detail-row"><span>Legitimacy</span><strong>{selectedTribe.leader ? formatPercent(selectedTribe.leader.legitimacy) : '0%'}</strong></div>
+                      <div className="detail-row"><span>Age / Tenure</span><strong>{selectedTribe.leader ? `${selectedTribe.leader.age} / ${selectedTribe.leader.tenure}` : '0 / 0'}</strong></div>
+                    </div>
+                  </div>
+                  <div className="subsection">
+                    <h3>Exchange and Risk</h3>
+                    <div className="detail-list">
+                      <div className="detail-row"><span>Knowledge Diffusion</span><strong>{selectedTribe.exchange.diffusion.toFixed(2)}</strong></div>
+                      <div className="detail-row"><span>Raid Exposure</span><strong>{selectedTribe.exchange.raidExposure.toFixed(2)}</strong></div>
+                      <div className="detail-row"><span>Health Pressure</span><strong>{selectedTribe.pressures.health.toFixed(2)}</strong></div>
+                      <div className="detail-row"><span>Climate / Story</span><strong>{`${climateStatus} / ${storytellerStatus}`}</strong></div>
+                      <div className="detail-row"><span>Tile</span><strong>{selectedTribe.tileId}</strong></div>
+                      <div className="detail-row"><span>Ancestry</span><strong>{selectedTribe.ancestryId}</strong></div>
+                    </div>
+                  </div>
+                  <div className="tag-list">
+                    {selectedTribeAllies.length ? selectedTribeAllies.map((ally) => (
+                      <StatusChip key={ally} label={`Allied with ${ally}`} tone="success" />
+                    )) : <StatusChip label="No active alliances" />}
+                  </div>
+                </>
               ) : <div className="empty-state">No tribe selected.</div>}
               <AbilityRows tribe={selectedTribe} />
             </>
@@ -653,13 +854,16 @@ export function App() {
             <>
               <div className="section-heading">
                 <h2>Relations</h2>
-                <p>Seeded relationship edges for later diplomacy and trade systems.</p>
+                <p>Live diplomacy, alliance, and hostility edges shaped by trade, raids, and co-location pressure.</p>
               </div>
               <div className="list-stack">
                 {relations.length ? relations.map(([tribeId, value]) => (
                   <div className="list-row" key={tribeId}>
                     <span>{tribeNameById.get(tribeId) ?? tribeId}</span>
-                    <strong>{value.toFixed(2)}</strong>
+                    <div className="list-row__aside">
+                      {selectedTribe?.alliances.includes(tribeId) ? <StatusChip label="Allied" tone="success" /> : null}
+                      <strong>{value.toFixed(2)}</strong>
+                    </div>
                   </div>
                 )) : <div className="empty-state">No relationship edges are available for the selected tribe.</div>}
               </div>
@@ -703,12 +907,9 @@ export function App() {
             <h2>Chronology</h2>
             <p>Recent simulation entries pinned for operational review.</p>
           </div>
-          <div className="list-stack list-stack--compact">
+          <div className="chronology-list">
             {deferredWorldState.eventLog.slice(0, 8).map((event) => (
-              <div className="list-row list-row--event" key={event.id}>
-                <span>{event.title}</span>
-                <strong>Y{event.year}</strong>
-              </div>
+              <ChronologyEntry event={event} key={event.id} />
             ))}
           </div>
         </div>

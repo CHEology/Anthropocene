@@ -11,7 +11,8 @@
     "preview": "vite preview",
     "server:build": "tsc -p tsconfig.server.json",
     "server:start": "node dist-server/server/index.js",
-    "test": "vitest"
+    "test": "vitest",
+    "policy:train": "npm run server:build && node dist-server/server/trainDecisionPolicy.js"
   },
   "dependencies": {
     "@types/react": "^19.2.14",

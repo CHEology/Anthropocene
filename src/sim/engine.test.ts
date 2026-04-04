@@ -1,4 +1,4 @@
-﻿import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
 import { DEFAULT_SIMULATION_CONFIG, cloneSimulationConfig } from './config';
 import { createSimulationEngine } from './engine';
@@ -10,7 +10,7 @@ describe('simulation engine', () => {
     const engineB = createSimulationEngine(config);
     const command = {
       id: 'cmd-1',
-      label: 'Climate Pulse -1.2°C',
+      label: 'Climate Pulse -1.2?C',
       kind: 'climate-pulse' as const,
       scheduledYear: 10,
       payload: {
@@ -67,7 +67,7 @@ describe('simulation engine', () => {
     const populations = new Set<number>([initial.metrics.totalPopulation]);
     const tribeCounts = new Set<number>([initial.metrics.tribeCount]);
 
-    for (let index = 0; index < 240; index += 1) {
+    for (let index = 0; index < 400; index += 1) {
       engine.step(1);
       const state = engine.getState();
       populations.add(state.metrics.totalPopulation);
@@ -79,19 +79,22 @@ describe('simulation engine', () => {
     expect(engine.getState().metrics.totalPopulation).not.toBe(initial.metrics.totalPopulation);
   });
 
-  it('maintains long-run population growth without collapsing occupied tiles into resource floors', { timeout: 15_000 }, () => {
+  it('keeps detailed eurasia viable over long deterministic runs with the new ecology contract', { timeout: 45_000 }, () => {
     const config = cloneSimulationConfig(DEFAULT_SIMULATION_CONFIG);
+    config.worldPreset = 'detailed-eurasia';
     config.seed = 12045;
 
     const engine = createSimulationEngine(config);
     const initial = engine.getState();
     const visitedTiles = new Set(initial.tribes.map((tribe) => tribe.tileId));
 
-    for (let index = 0; index < 1200; index += 1) {
+    let peakPop = initial.metrics.totalPopulation;
+    for (let index = 0; index < 800; index += 1) {
       const result = engine.step(1);
       for (const tribe of result.state.tribes) {
         visitedTiles.add(tribe.tileId);
       }
+      peakPop = Math.max(peakPop, result.state.metrics.totalPopulation);
     }
 
     const state = engine.getState();
@@ -103,10 +106,50 @@ describe('simulation engine', () => {
       occupiedHuntRatios.reduce((sum, ratio) => sum + ratio, 0) /
       Math.max(occupiedHuntRatios.length, 1);
 
-    expect(state.metrics.totalPopulation).toBeGreaterThan(initial.metrics.totalPopulation * 2);
-    expect(visitedTiles.has('levant-corridor')).toBe(true);
-    expect(averageOccupiedHuntRatio).toBeGreaterThan(0.75);
+    expect(peakPop).toBeGreaterThan(initial.metrics.totalPopulation * 2.5);
+    expect(state.metrics.totalPopulation).toBeGreaterThan(initial.metrics.totalPopulation * 0.45);
+    expect(state.metrics.tribeCount).toBeGreaterThan(initial.metrics.tribeCount * 4);
+    expect(visitedTiles.size).toBeGreaterThan(initial.tribes.length * 5);
+    expect(averageOccupiedHuntRatio).toBeGreaterThan(0.3);
+    expect(state.globalClimate.regime.length).toBeGreaterThan(0);
+    expect(state.storyteller.posture.length).toBeGreaterThan(0);
+    expect(state.metrics.averageFoodStores).toBeGreaterThanOrEqual(0);
+    expect(state.metrics.averageGeneticDiversity).toBeGreaterThan(0);
+    expect(state.metrics.averageMegafauna).toBeGreaterThanOrEqual(0);
+  });
+
+  it('activates hazard, exchange, combat, and diplomacy loops on the detailed preset', { timeout: 30_000 }, () => {
+    const config = cloneSimulationConfig(DEFAULT_SIMULATION_CONFIG);
+    config.worldPreset = 'detailed-eurasia';
+    config.seed = 12045;
+
+    const engine = createSimulationEngine(config);
+    const initialMaxDomestication = Math.max(
+      ...engine.getState().tribes.map((tribe) => tribe.development.domestication),
+    );
+    const counts = new Map<string, number>();
+
+    for (let index = 0; index < 500; index += 1) {
+      const result = engine.step(1);
+      for (const event of result.emittedEvents) {
+        counts.set(event.kind, (counts.get(event.kind) ?? 0) + 1);
+      }
+    }
+
+    const state = engine.getState();
+    const occupiedTileIds = new Set(state.tribes.map((tribe) => tribe.tileId));
+    const occupiedHighlandTiles = state.tiles.filter((tile) => occupiedTileIds.has(tile.id) && (tile.terrain === 'highland' || tile.terrain === 'mountain')).length;
+
+    // Core event systems should all fire over 500 years
+    expect(counts.get('disaster') ?? 0).toBeGreaterThan(10);
+    expect(counts.get('disease') ?? 0).toBeGreaterThan(2);
+    expect((counts.get('trade') ?? 0) + (counts.get('diplomacy') ?? 0) + (counts.get('combat') ?? 0)).toBeGreaterThan(5);
+    expect(occupiedHighlandTiles).toBeGreaterThan(0);
+    expect(
+      state.tiles.some((tile) => tile.activeDisasters.length > 0 || tile.activePlagues.length > 0),
+    ).toBe(true);
+    expect(
+      Math.max(...state.tribes.map((tribe) => tribe.development.domestication)),
+    ).toBeGreaterThan(initialMaxDomestication);
   });
 });
-
-

@@ -3,11 +3,11 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { DEFAULT_SIMULATION_CONFIG, cloneSimulationConfig } from '../sim/config';
+import type { SimulationConfig } from '../sim/types';
 import { createInitialWorldState } from '../world/oldWorld';
 import { App } from './App';
 
-function buildSessionPayload() {
-  const config = cloneSimulationConfig(DEFAULT_SIMULATION_CONFIG);
+function buildSessionPayload(config: SimulationConfig = cloneSimulationConfig(DEFAULT_SIMULATION_CONFIG)) {
   return {
     session: {
       id: 'session-1',
@@ -30,7 +30,7 @@ beforeEach(() => {
   document.documentElement.removeAttribute('data-theme');
   document.documentElement.style.colorScheme = '';
 
-  const sessionPayload = buildSessionPayload();
+  let sessionPayload = buildSessionPayload();
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -41,8 +41,11 @@ beforeEach(() => {
             ? input.toString()
             : input.url;
       const method = init?.method ?? 'GET';
+      const body = typeof init?.body === 'string' ? JSON.parse(init.body) : undefined;
 
       if (url.endsWith('/api/simulations') && method === 'POST') {
+        const config = body?.config ?? cloneSimulationConfig(DEFAULT_SIMULATION_CONFIG);
+        sessionPayload = buildSessionPayload(config);
         return Response.json(sessionPayload, { status: 201 });
       }
 
@@ -59,8 +62,8 @@ beforeEach(() => {
           {
             session: sessionPayload.session,
             result: {
-              previousYear: 0,
-              nextYear: 1,
+              previousYear: sessionPayload.session.state.year,
+              nextYear: sessionPayload.session.state.year + 1,
               emittedEvents: [],
               changedTileIds: [],
               changedTribeIds: [],
@@ -86,6 +89,8 @@ beforeEach(() => {
       }
 
       if (url.includes('/api/simulations/session-1/reset') && method === 'POST') {
+        const config = body?.config ?? sessionPayload.session.config;
+        sessionPayload = buildSessionPayload(config);
         return Response.json(sessionPayload, { status: 200 });
       }
 
@@ -123,5 +128,28 @@ describe('app shell', () => {
     await user.click(screen.getByRole('button', { name: 'Theme: Dark' }));
     expect(document.documentElement.dataset.theme).toBe('light');
     expect(window.localStorage.getItem('anthropocene-theme')).toBe('light');
+  });
+
+  it('applies preset changes immediately', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Preset' }), 'detailed-eurasia');
+
+    expect(await screen.findByRole('heading', { name: 'Detailed Eurasia' })).toBeInTheDocument();
+    expect(screen.getByText(/A ~400-tile Eurasian field/i)).toBeInTheDocument();
+  });
+
+  it('surfaces tribe development details for the detailed preset', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Preset' }), 'detailed-eurasia');
+    await user.click(screen.getByRole('button', { name: 'tribe' }));
+
+    expect(screen.getByText('Leader State')).toBeInTheDocument();
+    expect(screen.getByText('Tending')).toBeInTheDocument();
+    expect(screen.getByText('Food Stores')).toBeInTheDocument();
+    expect(screen.getByText('Genetic')).toBeInTheDocument();
   });
 });

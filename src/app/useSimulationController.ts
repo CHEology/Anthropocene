@@ -175,6 +175,7 @@ export function useSimulationController(
     }
 
     elapsedRef.current -= yearsToAdvance * millisecondsPerYear;
+    busyRef.current = true;
     void step(yearsToAdvance);
   });
 
@@ -214,7 +215,7 @@ export function useSimulationController(
         previousFrameRef.current = timestamp;
       }
 
-      const delta = timestamp - previousFrameRef.current;
+      const delta = Math.min(timestamp - previousFrameRef.current, 200);
       previousFrameRef.current = timestamp;
       advanceFrame(delta);
       frameRef.current = requestAnimationFrame(tick);

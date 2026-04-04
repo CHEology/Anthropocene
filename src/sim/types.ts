@@ -1,4 +1,4 @@
-﻿export type WorldPresetId = 'old-world-corridor';
+export type WorldPresetId = 'old-world-corridor' | 'detailed-eurasia';
 export type TerrainType =
   | 'river_valley'
   | 'savanna'
@@ -33,6 +33,47 @@ export type AbilityKey =
   | 'attack'
   | 'organization';
 export type InterventionKind = 'climate-pulse' | 'observation-note';
+export type LeaderArchetype = 'Pathfinder' | 'Steward' | 'Broker' | 'Sage';
+export type ClimateRegime =
+  | 'deep-glacial'
+  | 'glacial'
+  | 'cool-transition'
+  | 'temperate-window'
+  | 'warm-pulse'
+  | 'volcanic-winter';
+export type StorytellerPosture =
+  | 'quiet'
+  | 'balanced'
+  | 'prosperity'
+  | 'recovery'
+  | 'crisis';
+export type AgricultureStage =
+  | 'foraging'
+  | 'tending'
+  | 'cultivation'
+  | 'agropastoral'
+  | 'settled-farming';
+export type DisasterKind =
+  | 'drought'
+  | 'flood'
+  | 'wildfire'
+  | 'severe-winter'
+  | 'earthquake'
+  | 'eruption'
+  | 'supervolcano'
+  | 'megadrought';
+export type PlagueKind = 'waterborne' | 'respiratory' | 'zoonotic';
+export type SimulationEventKind =
+  | 'system'
+  | 'intervention'
+  | 'innovation'
+  | 'migration'
+  | 'warning'
+  | 'combat'
+  | 'trade'
+  | 'diplomacy'
+  | 'disaster'
+  | 'disease';
 export type SimulationPhase =
   | 'global-events'
   | 'tile-update'
@@ -49,8 +90,11 @@ export interface AbilityState {
 
 export interface LeaderState {
   name: string;
-  archetype: 'Pathfinder' | 'Steward' | 'Broker' | 'Sage';
+  archetype: LeaderArchetype;
   age: number;
+  tenure: number;
+  authority: number;
+  legitimacy: number;
 }
 
 export interface TribePressureState {
@@ -60,6 +104,7 @@ export interface TribePressureState {
   water: number;
   competition: number;
   organization: number;
+  health: number;
   total: number;
 }
 
@@ -67,6 +112,31 @@ export interface CarryingCapacityState {
   hunt: number;
   agri: number;
   water: number;
+}
+
+export interface ActiveDisasterState {
+  kind: DisasterKind;
+  severity: number;
+  remainingYears: number;
+}
+
+export interface ActivePlagueState {
+  kind: PlagueKind;
+  severity: number;
+  remainingYears: number;
+}
+
+export interface TribeDevelopmentState {
+  agricultureStage: AgricultureStage;
+  domestication: number;
+  sedentism: number;
+}
+
+export interface TribeExchangeState {
+  tradeVolume: number;
+  diffusion: number;
+  raidExposure: number;
+  warExhaustion: number;
 }
 
 export interface TileState {
@@ -86,10 +156,13 @@ export interface TileState {
   comfort: number;
   baseCarryingCapacity: CarryingCapacityState;
   carryingCapacity: CarryingCapacityState;
-  activeDisasters: string[];
-  activePlagues: string[];
+  activeDisasters: ActiveDisasterState[];
+  activePlagues: ActivePlagueState[];
   isVolcanic: boolean;
   isTectonic: boolean;
+  elevation: number;
+  megafaunaIndex: number;
+  coastal: boolean;
 }
 
 export interface TribeState {
@@ -102,6 +175,10 @@ export interface TribeState {
   leader: LeaderState | null;
   abilities: Record<AbilityKey, AbilityState>;
   pressures: TribePressureState;
+  development: TribeDevelopmentState;
+  exchange: TribeExchangeState;
+  geneticDiversity: number;
+  foodStores: number;
   relationships: Record<string, number>;
   alliances: string[];
   statusFlags: {
@@ -114,7 +191,7 @@ export interface TribeState {
 export interface SimulationEvent {
   id: string;
   year: number;
-  kind: 'system' | 'intervention' | 'innovation' | 'migration' | 'warning';
+  kind: SimulationEventKind;
   title: string;
   detail: string;
   tileId?: string;
@@ -147,6 +224,11 @@ export interface WorldMetrics {
   conflicts: number;
   averageComfort: number;
   averagePressure: number;
+  averageFoodStores: number;
+  averageGeneticDiversity: number;
+  averageMegafauna: number;
+  activeHazards: number;
+  activePlagues: number;
 }
 
 export interface MetricPoint {
@@ -157,6 +239,16 @@ export interface MetricPoint {
   conflicts: number;
 }
 
+export interface StorytellerState {
+  prosperity: number;
+  prosperityStreak: number;
+  crisisStreak: number;
+  quietStreak: number;
+  disasterMultiplier: number;
+  recoveryMultiplier: number;
+  posture: StorytellerPosture;
+}
+
 export interface WorldState {
   year: number;
   seed: number;
@@ -165,7 +257,9 @@ export interface WorldState {
     baseline: number;
     anomaly: number;
     meanTemperature: number;
+    regime: ClimateRegime;
   };
+  storyteller: StorytellerState;
   tiles: TileState[];
   tribes: TribeState[];
   eventLog: SimulationEvent[];
@@ -237,5 +331,7 @@ export interface WorldPresentation {
   routeLanes: RouteLane[];
   regionLabels: RegionLabel[];
   startTileId: string;
+  startTileName: string;
   startTribeId: string;
+  startTribeName: string;
 }

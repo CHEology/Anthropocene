@@ -1,4 +1,4 @@
-﻿import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
 import { DEFAULT_SIMULATION_CONFIG } from '../../sim/config';
 import { createInitialWorldState, getWorldPresentation } from '../../world/oldWorld';
@@ -27,7 +27,7 @@ describe('map layout', () => {
     expect(footprint.height).toBeGreaterThan(520);
   });
 
-  it('places labels without collisions for the default world view', () => {
+  it('hides tile labels when no tile is hovered', () => {
     const worldState = createInitialWorldState(DEFAULT_SIMULATION_CONFIG);
     const presentation = getWorldPresentation(DEFAULT_SIMULATION_CONFIG.worldPreset);
     const layout = createMapLayout(worldState.tiles, 1200, 760, 36);
@@ -42,6 +42,27 @@ describe('map layout', () => {
       presentation.startTileId,
       null,
     );
+
+    expect(labels).toHaveLength(0);
+  });
+
+  it('places hovered labels without collisions for the default world view', () => {
+    const worldState = createInitialWorldState(DEFAULT_SIMULATION_CONFIG);
+    const presentation = getWorldPresentation(DEFAULT_SIMULATION_CONFIG.worldPreset);
+    const layout = createMapLayout(worldState.tiles, 1200, 760, 36);
+    const labels = placeMapLabels(
+      worldState.tiles,
+      worldState.tribes,
+      presentation.regionLabels,
+      presentation.routeLanes,
+      layout,
+      1200,
+      760,
+      null,
+      presentation.startTileId,
+    );
+
+    expect(labels.length).toBeGreaterThan(0);
 
     for (let index = 0; index < labels.length; index += 1) {
       for (let cursor = index + 1; cursor < labels.length; cursor += 1) {

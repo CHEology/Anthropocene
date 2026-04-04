@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+﻿import { randomUUID } from 'node:crypto';
 
 import { DEFAULT_SIMULATION_CONFIG, cloneSimulationConfig } from '../../src/sim/config.js';
 import type { InterventionCommand, SimulationConfig, WorldState } from '../../src/sim/types.js';
@@ -62,7 +62,10 @@ export function sanitizeSimulationConfig(
 
   return {
     seed: clampInteger(source.seed, 1, 2_147_483_647, base.seed),
-    worldPreset: source.worldPreset === 'old-world-corridor' ? source.worldPreset : base.worldPreset,
+    worldPreset:
+      source.worldPreset === 'old-world-corridor' || source.worldPreset === 'detailed-eurasia'
+        ? source.worldPreset
+        : base.worldPreset,
     globals: {
       G_birth: clampFiniteNumber(globals.G_birth, 0, 1, base.globals.G_birth),
       G_death: clampFiniteNumber(globals.G_death, 0, 1, base.globals.G_death),
@@ -283,6 +286,36 @@ export function assertWorldStateInvariants(state: WorldState) {
     0,
     SERVER_LIMITS.maxPressure,
   );
+  finiteNumberOrThrow(
+    state.metrics.averageFoodStores,
+    'World mean food stores must remain finite and bounded.',
+    0,
+    1,
+  );
+  finiteNumberOrThrow(
+    state.metrics.averageGeneticDiversity,
+    'World mean genetic diversity must remain finite and bounded.',
+    0,
+    1,
+  );
+  finiteNumberOrThrow(
+    state.metrics.averageMegafauna,
+    'World mean megafauna must remain finite and bounded.',
+    0,
+    1,
+  );
+  safeIntegerOrThrow(
+    state.metrics.activeHazards,
+    'Active hazard counts must remain within backend limits.',
+    0,
+    SERVER_LIMITS.maxMetricMagnitude,
+  );
+  safeIntegerOrThrow(
+    state.metrics.activePlagues,
+    'Active plague counts must remain within backend limits.',
+    0,
+    SERVER_LIMITS.maxMetricMagnitude,
+  );
 
   if (state.tiles.length > SERVER_LIMITS.maxTiles) {
     throw new InvariantError('Tile count exceeds the backend safety limit.', {
@@ -322,6 +355,18 @@ export function assertWorldStateInvariants(state: WorldState) {
       SERVER_LIMITS.maxMeanComfort,
     );
     finiteNumberOrThrow(
+      tile.elevation,
+      'Tile elevation must remain finite and bounded.',
+      -12000,
+      12000,
+    );
+    finiteNumberOrThrow(
+      tile.megafaunaIndex,
+      'Tile megafauna index must remain finite and bounded.',
+      0,
+      1,
+    );
+    finiteNumberOrThrow(
       tile.carryingCapacity.hunt,
       'Tile hunting capacity must remain finite and bounded.',
       0,
@@ -339,6 +384,26 @@ export function assertWorldStateInvariants(state: WorldState) {
       0,
       SERVER_LIMITS.maxCapacity,
     );
+
+    for (const disaster of tile.activeDisasters) {
+      finiteNumberOrThrow(disaster.severity, 'Disaster severity must remain finite and bounded.', 0, 1);
+      safeIntegerOrThrow(
+        disaster.remainingYears,
+        'Disaster duration must remain within supported bounds.',
+        0,
+        SERVER_LIMITS.maxYearsPerSession,
+      );
+    }
+
+    for (const plague of tile.activePlagues) {
+      finiteNumberOrThrow(plague.severity, 'Plague severity must remain finite and bounded.', 0, 1);
+      safeIntegerOrThrow(
+        plague.remainingYears,
+        'Plague duration must remain within supported bounds.',
+        0,
+        SERVER_LIMITS.maxYearsPerSession,
+      );
+    }
   }
 
   const tribeIds = new Set<string>();
@@ -369,10 +434,41 @@ export function assertWorldStateInvariants(state: WorldState) {
       0,
       SERVER_LIMITS.maxPressure,
     );
+    finiteNumberOrThrow(tribe.pressures.health, 'Tribe health pressure must remain finite and bounded.', 0, SERVER_LIMITS.maxPressure);
+    finiteNumberOrThrow(tribe.development.domestication, 'Tribe domestication progress must remain finite and bounded.', 0, 100);
+    finiteNumberOrThrow(tribe.development.sedentism, 'Tribe sedentism must remain finite and bounded.', 0, 1);
+    finiteNumberOrThrow(tribe.geneticDiversity, 'Tribe genetic diversity must remain finite and bounded.', 0, 1);
+    finiteNumberOrThrow(tribe.foodStores, 'Tribe food stores must remain finite and bounded.', 0, 1);
+    finiteNumberOrThrow(tribe.exchange.tradeVolume, 'Trade volume must remain finite and bounded.', 0, SERVER_LIMITS.maxPressure);
+    finiteNumberOrThrow(tribe.exchange.diffusion, 'Diffusion values must remain finite and bounded.', 0, SERVER_LIMITS.maxPressure);
+    finiteNumberOrThrow(tribe.exchange.raidExposure, 'Raid exposure must remain finite and bounded.', 0, SERVER_LIMITS.maxPressure);
+    finiteNumberOrThrow(tribe.exchange.warExhaustion, 'War exhaustion must remain finite and bounded.', 0, SERVER_LIMITS.maxPressure);
+
+    if (tribe.leader) {
+      safeIntegerOrThrow(tribe.leader.age, 'Leader age must remain a safe integer.', 0, 120);
+      safeIntegerOrThrow(tribe.leader.tenure, 'Leader tenure must remain a safe integer.', 0, SERVER_LIMITS.maxYearsPerSession);
+      finiteNumberOrThrow(tribe.leader.authority, 'Leader authority must remain finite and bounded.', 0, 1);
+      finiteNumberOrThrow(tribe.leader.legitimacy, 'Leader legitimacy must remain finite and bounded.', 0, 1);
+    }
 
     for (const ability of Object.values(tribe.abilities)) {
       finiteNumberOrThrow(ability.cap, 'Ability caps must remain finite.', 0, 100);
       finiteNumberOrThrow(ability.current, 'Ability values must remain finite.', 0, 100);
+    }
+
+    for (const relation of Object.values(tribe.relationships)) {
+      finiteNumberOrThrow(relation, 'Relationship values must remain finite and bounded.', -1, 1);
+    }
+  }
+
+  for (const tribe of state.tribes) {
+    for (const allianceId of tribe.alliances) {
+      if (!tribeIds.has(allianceId)) {
+        throw new InvariantError('Alliance references a tribe that does not exist.', {
+          tribeId: tribe.id,
+          allianceId,
+        });
+      }
     }
   }
 
@@ -421,3 +517,4 @@ export function assertWorldStateInvariants(state: WorldState) {
     );
   }
 }
+

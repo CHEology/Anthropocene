@@ -1,4 +1,4 @@
-﻿import type { RegionLabel, RouteLane, TileState, TribeState } from '../../sim/types';
+import type { RegionLabel, RouteLane, TileState, TribeState } from '../../sim/types';
 
 const SQRT_3 = Math.sqrt(3);
 
@@ -143,10 +143,6 @@ function placeBox(
   return { x: center.x - width - diagonal, y: center.y - radius - gap - height * 0.8 };
 }
 
-function getRouteActivity(routeLanes: RouteLane[], tileId: string) {
-  return routeLanes.reduce((count, route) => count + (route.tileIds.includes(tileId) ? 1 : 0), 0);
-}
-
 export function placeMapLabels(
   tiles: TileState[],
   tribes: TribeState[],
@@ -158,28 +154,23 @@ export function placeMapLabels(
   selectedTileId: string | null,
   hoveredTileId: string | null,
 ) {
+  void tribes;
+  void routeLanes;
+  void selectedTileId;
+
   const accepted: MapLabelPlacement[] = [];
-  const occupiedTileIds = new Set(tribes.map((tribe) => tribe.tileId));
+  const focusTileId = hoveredTileId;
+  if (!focusTileId) {
+    return accepted;
+  }
+
   const tileCandidates: TileLabelCandidate[] = tiles
+    .filter((tile) => tile.id === focusTileId)
     .map((tile) => ({
       tile,
-      priority:
-        tile.id === selectedTileId
-          ? 100
-          : tile.id === hoveredTileId
-            ? 95
-            : occupiedTileIds.has(tile.id)
-              ? 75
-              : getRouteActivity(routeLanes, tile.id) > 1
-                ? 60
-                : 0,
-      detail:
-        tile.id === selectedTileId || tile.id === hoveredTileId
-          ? `${tile.region} · ${tile.climate}`
-          : undefined,
-    }))
-    .filter((candidate) => candidate.priority > 0)
-    .sort((left, right) => right.priority - left.priority);
+      priority: 100,
+      detail: `${tile.region} | ${tile.climate} | mega ${Math.round(tile.megafaunaIndex * 100)}%`,
+    }));
 
   const tileAnchors: AnchorDirection[] = ['n', 'ne', 'nw', 's', 'e', 'w', 'se', 'sw'];
   const regionAnchors: AnchorDirection[] = ['e', 'ne', 'n', 'se', 's', 'w'];
@@ -239,6 +230,10 @@ export function placeMapLabels(
   };
 
   for (const label of regionLabels) {
+    if (label.tileId !== focusTileId) {
+      continue;
+    }
+
     const center = layout.centers.get(label.tileId);
     if (!center) {
       continue;
