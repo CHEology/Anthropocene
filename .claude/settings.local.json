@@ -9,7 +9,10 @@
       "Bash(npx tsc:*)",
       "Bash(python3 -c ':*)",
       "Bash(pip install:*)",
-      "Bash(node --loader ts-node/esm -e ':*)"
+      "Bash(node --loader ts-node/esm -e ':*)",
+      "Bash(tee /tmp/stress-test-results.txt)",
+      "Read(//tmp/**)",
+      "Bash(tee /tmp/stress-test-v2.txt)"
     ]
   }
 }

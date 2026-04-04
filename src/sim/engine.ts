@@ -13,6 +13,16 @@ import {
   type LearnedDecisionPolicy,
 } from './policy.js';
 import { createPrng, type Prng } from './prng.js';
+import {
+  TECH_TREE,
+  ALL_TECH_IDS,
+  hasTech,
+  hasAllPrerequisites,
+  getDiscoverableTechs,
+  getTechAbilityBonuses,
+  getTechHealthBonus,
+  getTechFoodStorageBonus,
+} from './techTree.js';
 import type {
   AbilityKey,
   ActiveDisasterState,
@@ -29,6 +39,7 @@ import type {
   SimulationPhase,
   SimulationStepResult,
   StorytellerState,
+  TechnologyId,
   TileState,
   TribeState,
   WorldMetrics,
@@ -40,7 +51,7 @@ const TARGET_BASELINE_TEMPERATURE = 15;
 const MIN_TRIBE_POPULATION = 25;
 const MAX_TRIBE_POPULATION = 1_000_000;
 const POPULATION_CARRY_LIMIT = 0.999999;
-const TRIBE_SPLIT_THRESHOLD = 180;
+const TRIBE_SPLIT_THRESHOLD = 220;
 const TRIBE_RELATION_BOUND = 0.95;
 
 const PHASES: SimulationPhase[] = [
@@ -224,12 +235,14 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
 
+// Pre-computed powers of 10 for fast rounding without toFixed string conversion
+const POW10 = [1, 10, 100, 1000, 10000];
 function round(value: number, digits = 3) {
   if (!Number.isFinite(value)) {
     return 0;
   }
-
-  return Number(value.toFixed(digits));
+  const m = POW10[digits] ?? (10 ** digits);
+  return Math.round(value * m) / m;
 }
 
 function deriveClimateRegime(meanTemperature: number, anomaly: number): WorldState['globalClimate']['regime'] {
@@ -329,6 +342,71 @@ function centuryClimateNoise(simYear: number): number {
   return 0.5 * Math.sin(simYear / 137 * 2 * Math.PI) * Math.sin(simYear / 311 * 2 * Math.PI);
 }
 
+function innovationEraFactor(simYear: number) {
+  const yearBP = Math.max(0, 70000 - simYear);
+  if (yearBP >= 50000) return 0.24;
+  if (yearBP >= 35000) return 0.36;
+  if (yearBP >= 20000) return 0.54;
+  if (yearBP >= 12000) return 0.76;
+  if (yearBP >= 6000) return 0.9;
+  return 1;
+}
+
+function agricultureEraFactor(simYear: number) {
+  const yearBP = Math.max(0, 70000 - simYear);
+  if (yearBP >= 25000) return 0.015;
+  if (yearBP >= 18000) return 0.06;
+  if (yearBP >= 14000) return 0.18;
+  if (yearBP >= 10000) return 0.46;
+  if (yearBP >= 7000) return 0.72;
+  return 1;
+}
+
+function domesticationEraCeiling(simYear: number) {
+  const yearBP = Math.max(0, 70000 - simYear);
+  if (yearBP >= 40000) return 12;
+  if (yearBP >= 25000) return 16;
+  if (yearBP >= 18000) return 22;
+  if (yearBP >= 14000) return 32;
+  if (yearBP >= 11000) return 52;
+  if (yearBP >= 8000) return 72;
+  return 100;
+}
+
+function technologyComplexity(techId: TechnologyId) {
+  const tech = TECH_TREE[techId];
+  if (!tech) {
+    return 1;
+  }
+
+  const categoryLoad =
+    tech.category === 'knowledge' ? 0.44
+    : tech.category === 'craft' ? 0.52
+    : tech.category === 'military' ? 0.4
+    : 0.26;
+
+  return clamp(
+    1 + tech.prerequisites.length * 0.42 + tech.populationRequirement / 110 + categoryLoad,
+    1,
+    4.4,
+  );
+}
+
+function technologyRegionalism(techId: TechnologyId) {
+  const tech = TECH_TREE[techId];
+  if (!tech) {
+    return 1;
+  }
+
+  const categoryBias =
+    tech.category === 'subsistence' ? 0.92
+    : tech.category === 'craft' ? 1.04
+    : tech.category === 'knowledge' ? 1.16
+    : 1.1;
+
+  return clamp(categoryBias + tech.prerequisites.length * 0.08 + tech.populationRequirement / 220, 0.92, 1.9);
+}
+
 function safeAverage(values: number[]) {
   return values.length
     ? values.reduce((sum, value) => sum + value, 0) / values.length
@@ -387,10 +465,12 @@ function shuffleIds(ids: string[], prng: Prng) {
   return result;
 }
 
-function getFoodCapacity(tile: TileState) {
+function getFoodCapacity(tile: TileState, coastalForaging = false) {
   const effectiveMegafauna = tile.megafaunaIndex < 0.1 ? 0 : tile.megafaunaIndex;
   const megafaunaBonus = 1 + effectiveMegafauna * 0.5;
-  return tile.carryingCapacity.hunt * megafaunaBonus + tile.carryingCapacity.agri;
+  // Coastal foraging bonus: foraging-stage tribes exploit shellfish/littoral resources
+  const coastBonus = coastalForaging && (tile.terrain === 'coast' || tile.movementTags.includes('coastal-corridor')) ? 45 : 0;
+  return tile.carryingCapacity.hunt * megafaunaBonus + tile.carryingCapacity.agri + coastBonus;
 }
 
 function sumDisasterSeverity(tile: TileState) {
@@ -702,24 +782,25 @@ function mobilityProfile(tribe: TribeState) {
   return clamp(1 - tribe.development.sedentism + (tribe.development.agricultureStage === 'foraging' ? 0.14 : 0), 0.08, 1.18);
 }
 
-function alliedPresenceOnTile(tribe: TribeState, tileId: string, tribes: TribeState[]) {
-  return clamp(
-    tribe.alliances.reduce((sum, allyId) => {
-      return sum + (tribes.some((candidate) => candidate.id === allyId && candidate.tileId === tileId) ? 1 : 0);
-    }, 0),
-    0,
-    3,
-  );
+function alliedPresenceOnTile(tribe: TribeState, tileId: string, tribeMap: Map<string, TribeState>) {
+  let count = 0;
+  for (const allyId of tribe.alliances) {
+    const ally = tribeMap.get(allyId);
+    if (ally && ally.tileId === tileId) count++;
+    if (count >= 3) break;
+  }
+  return count;
 }
 
-function hostilePresenceOnTile(tribe: TribeState, tileId: string, tribes: TribeState[]) {
-  return clamp(
-    tribes.reduce((sum, candidate) => {
-      return sum + (candidate.tileId === tileId && getRelationship(tribe, candidate.id) < -0.2 ? 1 : 0);
-    }, 0),
-    0,
-    4,
-  );
+function hostilePresenceOnTile(tribe: TribeState, tileId: string, tileToTribes: Map<string, TribeState[]>) {
+  const residents = tileToTribes.get(tileId);
+  if (!residents) return 0;
+  let count = 0;
+  for (const candidate of residents) {
+    if (getRelationship(tribe, candidate.id) < -0.2) count++;
+    if (count >= 4) break;
+  }
+  return count;
 }
 
 function applyDefeatShock(tribe: TribeState, severity: number, stripStores = true) {
@@ -769,35 +850,52 @@ function computeMetrics(
   previousMetrics: WorldMetrics,
   events: SimulationEvent[],
 ) {
-  const totalPopulation = state.tribes.reduce((sum, tribe) => sum + tribe.pop, 0);
+  let totalPopulation = 0;
+  let sumPressure = 0;
+  let sumFoodStores = 0;
+  let sumGeneticDiversity = 0;
+  for (const tribe of state.tribes) {
+    totalPopulation += tribe.pop;
+    sumPressure += tribe.pressures.total;
+    sumFoodStores += tribe.foodStores;
+    sumGeneticDiversity += tribe.geneticDiversity;
+  }
   const tribeCount = state.tribes.length;
-  const averageComfort =
-    state.tiles.reduce((sum, tile) => sum + tile.comfort, 0) / Math.max(state.tiles.length, 1);
-  const averagePressure =
-    state.tribes.reduce((sum, tribe) => sum + tribe.pressures.total, 0) /
-    Math.max(state.tribes.length, 1);
-  const averageFoodStores =
-    state.tribes.reduce((sum, tribe) => sum + tribe.foodStores, 0) / Math.max(state.tribes.length, 1);
-  const averageGeneticDiversity =
-    state.tribes.reduce((sum, tribe) => sum + tribe.geneticDiversity, 0) / Math.max(state.tribes.length, 1);
-  const averageMegafauna =
-    state.tiles.reduce((sum, tile) => sum + tile.megafaunaIndex, 0) / Math.max(state.tiles.length, 1);
-  const activeHazards = state.tiles.reduce((sum, tile) => sum + tile.activeDisasters.length, 0);
-  const activePlagues = state.tiles.reduce((sum, tile) => sum + tile.activePlagues.length, 0);
+  const tribeDiv = Math.max(tribeCount, 1);
+
+  let sumComfort = 0;
+  let sumMegafauna = 0;
+  let activeHazards = 0;
+  let activePlagues = 0;
+  let landTileCount = 0;
+  for (const tile of state.tiles) {
+    if (tile.terrain === 'sea') continue;
+    landTileCount++;
+    sumComfort += tile.comfort;
+    sumMegafauna += tile.megafaunaIndex;
+    activeHazards += tile.activeDisasters.length;
+    activePlagues += tile.activePlagues.length;
+  }
+  const tileDiv = Math.max(landTileCount, 1);
+
+  // Single pass over events for innovation and conflict counts
+  let innovationCount = 0;
+  let conflictCount = 0;
+  for (const event of events) {
+    if (event.kind === 'innovation') innovationCount++;
+    else if (event.kind === 'warning' || event.kind === 'combat') conflictCount++;
+  }
 
   return {
     totalPopulation,
     tribeCount,
-    innovations:
-      previousMetrics.innovations + events.filter((event) => event.kind === 'innovation').length,
-    conflicts:
-      previousMetrics.conflicts +
-      events.filter((event) => event.kind === 'warning' || event.kind === 'combat').length,
-    averageComfort: round(averageComfort),
-    averagePressure: round(averagePressure),
-    averageFoodStores: round(averageFoodStores),
-    averageGeneticDiversity: round(averageGeneticDiversity, 4),
-    averageMegafauna: round(averageMegafauna),
+    innovations: previousMetrics.innovations + innovationCount,
+    conflicts: previousMetrics.conflicts + conflictCount,
+    averageComfort: round(sumComfort / tileDiv),
+    averagePressure: round(sumPressure / tribeDiv),
+    averageFoodStores: round(sumFoodStores / tribeDiv),
+    averageGeneticDiversity: round(sumGeneticDiversity / tribeDiv, 4),
+    averageMegafauna: round(sumMegafauna / tileDiv),
     activeHazards,
     activePlagues,
   };
@@ -905,7 +1003,9 @@ function applyTilePhase(
   const previousTiles = tilesById(read);
   const tribesOnTile = new Map<string, TribeState[]>();
   for (const tribe of read.tribes) {
-    tribesOnTile.set(tribe.tileId, [...(tribesOnTile.get(tribe.tileId) ?? []), tribe]);
+    const list = tribesOnTile.get(tribe.tileId);
+    if (list) list.push(tribe);
+    else tribesOnTile.set(tribe.tileId, [tribe]);
   }
 
   const storytellerMod = write.storyteller.disasterMultiplier;
@@ -971,11 +1071,11 @@ function applyTilePhase(
       tile.terrain === 'mountain' ? 1.1 : tile.terrain === 'highland' ? 0.28 : 0;
     const recoveryMod = write.storyteller.recoveryMultiplier;
     const huntRecovery = Math.min(
-      previous.baseCarryingCapacity.hunt * 0.02 * recoveryMod,
+      previous.baseCarryingCapacity.hunt * 0.06 * recoveryMod,
       previous.baseCarryingCapacity.hunt - previous.carryingCapacity.hunt,
     );
     const agriRecovery = Math.min(
-      previous.baseCarryingCapacity.agri * 0.015 * recoveryMod,
+      previous.baseCarryingCapacity.agri * 0.05 * recoveryMod,
       previous.baseCarryingCapacity.agri - previous.carryingCapacity.agri,
     );
 
@@ -1148,17 +1248,18 @@ function applyTilePhase(
     );
     const localOutbreakChance =
       disasterMultiplier *
-      (0.0003 +
-        Math.max(0, density - 0.55) * 0.0026 +
-        settlement * 0.0014 +
-        tradeIntensity * 0.0011 +
-        (disasterKinds.has('flood') || disasterKinds.has('drought') ? 0.0012 : 0));
+      (0.00018 +
+        Math.max(0, density - 0.48) * 0.0038 +
+        settlement * 0.0018 +
+        tradeIntensity * 0.0014 +
+        (disasterKinds.has('flood') || disasterKinds.has('drought') ? 0.0014 : 0));
     const spreadChance =
       neighborPlaguePressure > 0 && totalPopulation > 0
         ? clamp(
-            neighborPlaguePressure * (0.016 + tradeIntensity * 0.04 + settlement * 0.03),
+            neighborPlaguePressure *
+              (0.022 + tradeIntensity * 0.05 + settlement * 0.04 + Math.max(0, density - 0.6) * 0.02),
             0,
-            0.18,
+            0.24,
           )
         : 0;
 
@@ -1171,7 +1272,8 @@ function applyTilePhase(
       }
 
       if (!plagueKinds.has(kind)) {
-        const severity = 0.16 + prng.next() * 0.28 + Math.max(0, density - 0.6) * 0.08;
+        const severity =
+          0.18 + prng.next() * 0.3 + Math.max(0, density - 0.55) * 0.12 + settlement * 0.04;
         plagues.push(buildPlague(kind, severity, prng.nextInt(4, 9)));
         events.push({
           id: eventId('disease', write.year, events.length),
@@ -1302,16 +1404,18 @@ function computeTribeResourceContext(
   const plagueBurden = sumPlagueSeverity(tile) * stageProfile.plagueVulnerability;
   const tradeSupport = tribe.exchange.tradeVolume * 22 * leaderModifiers.trade;
   const diffusionSupport = tribe.exchange.diffusion * 8 * leaderModifiers.innovation;
-  const foragePenalty = 1 - clamp(disasterBurden * 0.16 + plagueBurden * 0.05, 0, 0.48);
-  const farmPenalty = 1 - clamp(disasterBurden * 0.18 + plagueBurden * 0.04, 0, 0.52);
+  const foragePenalty =
+    1 - clamp(disasterBurden * 0.22 + plagueBurden * 0.08 + Math.max(0, 0.32 - tribe.foodStores) * 0.06, 0, 0.62);
+  const farmPenalty =
+    1 - clamp(disasterBurden * 0.26 + plagueBurden * 0.07 + Math.max(0, 0.28 - tribe.foodStores) * 0.05, 0, 0.66);
   const huntDensity = safeTilePopulation / Math.max(tile.carryingCapacity.hunt, tribe.pop, 1);
   const foodCapacity = getFoodCapacity(tile);
   const foodDensity = tilePopulation / Math.max(foodCapacity, 1);
-  const crowdingThreshold = 0.58 + stageProfile.targetSedentism * 0.22 + tribe.alliances.length * 0.018;
+  const crowdingThreshold = 0.5 + stageProfile.targetSedentism * 0.18 + tribe.alliances.length * 0.012;
   const crowdingForagePenalty =
-    1 - clamp(Math.max(0, huntDensity - (0.62 + stageProfile.targetSedentism * 0.15)) * (0.32 + mobility * 0.4), 0, 0.82);
+    1 - clamp(Math.max(0, huntDensity - (0.56 + stageProfile.targetSedentism * 0.12)) * (0.46 + mobility * 0.62), 0, 0.9);
   const crowdingFarmPenalty =
-    1 - clamp(Math.max(0, foodDensity - (0.92 + stageProfile.targetSedentism * 0.12)) * (0.1 + stageProfile.targetSedentism * 0.18), 0, 0.36);
+    1 - clamp(Math.max(0, foodDensity - (0.84 + stageProfile.targetSedentism * 0.1)) * (0.16 + stageProfile.targetSedentism * 0.26), 0, 0.5);
   const effectiveMegafauna = tile.megafaunaIndex < 0.1 ? 0 : tile.megafaunaIndex;
   const megafaunaBonus = 1 + effectiveMegafauna * 0.5;
   const effectiveForaging = round(
@@ -1388,9 +1492,9 @@ function computeTribeResourceContext(
   const water = clamp(1 - supportedByWater / Math.max(tribe.pop, 1), 0, 1);
   const competition = clamp(
     (foodDensity - crowdingThreshold) *
-      (1.18 + mobility * 0.9 + (stageProfile.targetSedentism < 0.22 ? 0.18 : 0)) +
-      resourceCollapse * 0.12 +
-      Math.max(0, tilePopulation / Math.max(tile.baseCarryingCapacity.hunt + tile.baseCarryingCapacity.agri, 1) - 1.05) * 0.1,
+      (1.32 + mobility * 1.02 + (stageProfile.targetSedentism < 0.22 ? 0.24 : 0.08)) +
+      resourceCollapse * 0.22 +
+      Math.max(0, tilePopulation / Math.max(tile.baseCarryingCapacity.hunt + tile.baseCarryingCapacity.agri, 1) - 0.88) * 0.22,
     0,
     1,
   );
@@ -1403,34 +1507,39 @@ function computeTribeResourceContext(
     1,
   );
   const health = clamp(
-    plagueBurden * 0.62 +
-      disasterBurden * 0.12 +
-      stageProfile.plagueVulnerability * 0.08 +
-      tribe.exchange.raidExposure * 0.24 +
-      tribe.exchange.warExhaustion * 0.2 +
-      geneticRisk * 0.18 +
-      defeatVulnerability * 0.12 +
-      Math.max(0, foodDensity - 0.95) * 0.14 -
-      tribe.abilities.waterEngineering.current / 220 -
-      (leaderModifiers.plagueResilience - 1) * 0.18,
+    plagueBurden * 0.78 +
+      disasterBurden * 0.18 +
+      stageProfile.plagueVulnerability * 0.1 +
+      tribe.exchange.raidExposure * 0.26 +
+      tribe.exchange.warExhaustion * 0.24 +
+      geneticRisk * 0.22 +
+      defeatVulnerability * 0.16 +
+      Math.max(0, foodDensity - 0.82) * 0.2 +
+      Math.max(0, 0.24 - tribe.foodStores) * 0.18 -
+      tribe.abilities.waterEngineering.current / 210 -
+      (leaderModifiers.plagueResilience - 1) * 0.22,
     0,
     1,
   );
+  const techBonuses = getTechAbilityBonuses(tribe.knownTechnologies);
+  const techCarryBonus = (techBonuses.organization + techBonuses.agriculture + techBonuses.waterEngineering) * 0.6;
   const carryingCapacity = round(
     clamp(
-      Math.min(effectiveFoodWithStores, supportedByWater + effectiveStoredFood * 0.12) +
-        tile.habitability * 11.5 +
-        tile.water * 8.2 +
-        tile.comfort * 1.8 +
-        (tile.terrain === 'highland' ? (1 - stageProfile.targetSedentism) * 5.5 : 0) +
-        tribe.abilities.organization.current * 0.9 +
-        stageProfile.organizationBonus * 2.2 +
-        tradeSupport * 3.2 -
+      Math.min(effectiveFoodWithStores, supportedByWater + effectiveStoredFood * 0.16) +
+        tile.habitability * 12 +
+        tile.water * 10 +
+        tile.comfort * 1.6 +
+        (tile.terrain === 'highland' ? (1 - stageProfile.targetSedentism) * 9 : 0) +
+        tribe.abilities.organization.current * 0.95 +
+        stageProfile.organizationBonus * 2.8 +
+        tradeSupport * 3.2 +
+        techCarryBonus -
         plagueBurden * 18 -
-        tribe.exchange.warExhaustion * 10 -
+        disasterBurden * 8 -
+        tribe.exchange.warExhaustion * 9 -
         competition * 14 -
         resourceCollapse * 12 -
-        geneticRisk * 8,
+        geneticRisk * 6.5,
       MIN_TRIBE_POPULATION * 2,
       MAX_TRIBE_POPULATION,
     ),
@@ -1613,6 +1722,13 @@ function applyTribePhase(
 
     target.statusFlags.migrating = false;
     target.statusFlags.recovering = false;
+    target.migration.homeTileId = source.migration.homeTileId || source.tileId;
+    target.migration.cooldownYears = Math.max(0, source.migration.cooldownYears - 1);
+    if (!source.migration.destinationTileId) {
+      target.migration.destinationTileId = null;
+      target.migration.plannedRouteTileIds = [];
+      target.migration.commitmentYears = 0;
+    }
 
     const resourceContext = computeTribeResourceContext(
       source,
@@ -1627,28 +1743,121 @@ function applyTribePhase(
     tileLoads.set(source.tileId, existingTileLoad);
     target.pressures = resourceContext.pressures;
 
-    const innovationProbability =
+    // --- Tech tree: discovery ---
+    const discoverableTechs = getDiscoverableTechs(target.knownTechnologies);
+    const eraInnovation = innovationEraFactor(write.year);
+    const memoryAndSurplus =
+      0.24 +
+      source.exchange.diffusion * 0.48 +
+      source.exchange.tradeVolume * 0.22 +
+      Math.max(0, source.foodStores - 0.14) * 0.34 +
+      Math.max(0, 1 - target.pressures.health) * 0.1;
+    const discoveryBase =
       config.globals.G_innovation *
-      clamp(Math.log10(Math.max(source.pop, 10)) / 2.4, 0.18, 1.85) *
-      (1 + target.pressures.total * 2.5 + source.exchange.diffusion * 0.8) *
+      eraInnovation *
+      clamp(Math.log10(Math.max(source.pop, 10)) / 3.1, 0.08, 0.82) *
+      clamp(
+        0.22 +
+          target.pressures.total * 0.52 +
+          target.pressures.food * 0.18 +
+          target.pressures.organization * 0.16 +
+          resourceContext.megafaunaDecline * 0.08,
+        0.1,
+        1.05,
+      ) *
+      clamp(memoryAndSurplus, 0.16, 1.2) *
       leaderModifiers.innovation;
 
-    if (prng.next() < innovationProbability) {
-      const ability = pickAbility(target, prng);
-      const gain = prng.nextInt(1, 3) + (source.exchange.diffusion > 0.24 ? 1 : 0);
-      target.abilities[ability].cap = clamp(target.abilities[ability].cap + gain, 0, 100);
-      target.abilities[ability].current = clamp(target.abilities[ability].current + gain, 0, 100);
+    let didDiscover = false;
+    if (discoverableTechs.length > 0 && prng.next() < discoveryBase) {
+      const weights = discoverableTechs.map((techId) => {
+        const tech = TECH_TREE[techId];
+        const complexity = technologyComplexity(techId);
+        let weight = tech.discoveryWeight / complexity;
+        if (tech.category === 'subsistence' && target.pressures.food > 0.2) weight *= 1.35;
+        if (tech.category === 'military' && target.pressures.competition > 0.25) weight *= 1.22;
+        if (tech.category === 'knowledge' && target.pressures.organization > 0.15) weight *= 1.16;
+        if (tech.category === 'knowledge' && source.exchange.diffusion < 0.04) weight *= 0.6;
+        if (tech.category === 'craft' && source.foodStores < 0.18) weight *= 0.72;
+        if (write.year < 6000 && tech.populationRequirement > 45) weight *= 0.35;
+        if (write.year < 12000 && tech.populationRequirement > 70) weight *= 0.25;
+        if (write.year < 20000 && tech.populationRequirement > 90) weight *= 0.18;
+        if (source.pop < tech.populationRequirement * 0.9) weight *= 0.12;
+        return { techId, weight };
+      });
+      const totalWeight = weights.reduce((sum, w) => sum + w.weight, 0);
+      let cursor = prng.next() * totalWeight;
+      let chosenTech: TechnologyId = weights[0].techId;
+      for (const w of weights) {
+        cursor -= w.weight;
+        if (cursor <= 0) { chosenTech = w.techId; break; }
+      }
+      target.knownTechnologies = [...target.knownTechnologies, chosenTech];
+      const tech = TECH_TREE[chosenTech];
+      for (const [ability, bonus] of Object.entries(tech.effects)) {
+        const a = ability as AbilityKey;
+        target.abilities[a].cap = clamp(target.abilities[a].cap + (bonus as number), 0, 100);
+        target.abilities[a].current = clamp(target.abilities[a].current + (bonus as number), 0, 100);
+      }
+      didDiscover = true;
       target.statusFlags.highlighted = true;
       events.push({
         id: eventId('innovation', write.year, events.length),
         year: write.year,
         kind: 'innovation',
-        title: `${target.name} adapted`,
-        detail: `${ability} improved by +${gain} under ${round(target.pressures.total * 100, 0)} pressure index.`,
+        title: `${target.name} discovered ${tech.name}`,
+        detail: `${target.name} developed ${tech.name} (${tech.category}) under ${round(target.pressures.total * 100, 0)} pressure index.`,
         tribeId: target.id,
         tileId: target.tileId,
       });
-    } else {
+    }
+
+    // --- Tech tree: regression (can lose techs if conditions are bad) ---
+    if (!didDiscover && target.knownTechnologies.length > 0) {
+      for (const techId of [...target.knownTechnologies]) {
+        const tech = TECH_TREE[techId];
+        if (!tech) continue;
+        if (
+          tech.prerequisites.length === 0 &&
+          source.pop > 30 &&
+          resourceContext.disasterBurden + resourceContext.plagueBurden + source.exchange.warExhaustion < 1.25
+        ) {
+          continue;
+        }
+        let regressionRisk = tech.regressionChance;
+        if (source.pop < tech.populationRequirement * 0.6) regressionRisk *= 3;
+        else if (source.pop < tech.populationRequirement) regressionRisk *= 1.5;
+        regressionRisk += resourceContext.disasterBurden * 0.002;
+        regressionRisk += resourceContext.plagueBurden * 0.0025;
+        regressionRisk += source.exchange.warExhaustion * 0.0014;
+        regressionRisk += Math.max(0, 0.22 - source.foodStores) * 0.01;
+        if (tech.category === 'knowledge' && source.exchange.diffusion < 0.04) regressionRisk *= 1.4;
+        if (prng.next() < regressionRisk) {
+          const dependents = target.knownTechnologies.filter((tid) =>
+            TECH_TREE[tid]?.prerequisites.includes(techId),
+          );
+          if (dependents.length === 0) {
+            target.knownTechnologies = target.knownTechnologies.filter((t) => t !== techId);
+            for (const [ability, bonus] of Object.entries(tech.effects)) {
+              const a = ability as AbilityKey;
+              target.abilities[a].cap = clamp(target.abilities[a].cap - (bonus as number), 0, 100);
+              target.abilities[a].current = clamp(target.abilities[a].current - (bonus as number), 0, 100);
+            }
+            events.push({
+              id: eventId('innovation', write.year, events.length),
+              year: write.year,
+              kind: 'innovation',
+              title: `${target.name} lost ${tech.name}`,
+              detail: `${target.name} could no longer sustain ${tech.name} knowledge under declining conditions.`,
+              tribeId: target.id,
+              tileId: target.tileId,
+            });
+            break;
+          }
+        }
+      }
+      target.statusFlags.highlighted = false;
+    } else if (!didDiscover) {
       target.statusFlags.highlighted = false;
     }
 
@@ -1696,18 +1905,18 @@ function applyTribePhase(
     const progressDelta =
       (agriSuitability * 0.48 +
         (tile.terrain === 'river_valley' ? 0.08 : tile.terrain === 'coast' ? 0.03 : 0) +
-        target.abilities.agriculture.current / 235 +
-        target.abilities.waterEngineering.current / 420 +
-        target.abilities.organization.current / 520 +
-        source.exchange.tradeVolume * 0.16 +
-        source.exchange.diffusion * 0.22 +
-        (leaderModifiers.agriculture - 1) * 0.62 +
-        Math.max(0, target.pressures.food - 0.12) * 0.36 +
-        Math.max(0, target.pressures.competition - 0.2) * 0.16 +
-        resourceContext.resourceCollapse * 0.2 +
-        resourceContext.megafaunaDecline * 0.24 +
-        storytellerPressure * 0.08 +
-        resourceContext.geneticRisk * 0.06 -
+        target.abilities.agriculture.current / 300 +
+        target.abilities.waterEngineering.current / 560 +
+        target.abilities.organization.current / 680 +
+        source.exchange.tradeVolume * 0.08 +
+        source.exchange.diffusion * 0.12 +
+        (leaderModifiers.agriculture - 1) * 0.42 +
+        Math.max(0, target.pressures.food - 0.12) * 0.28 +
+        Math.max(0, target.pressures.competition - 0.2) * 0.1 +
+        resourceContext.resourceCollapse * 0.14 +
+        resourceContext.megafaunaDecline * 0.18 +
+        storytellerPressure * 0.06 +
+        resourceContext.geneticRisk * 0.05 -
         resourceContext.effectiveStoredFood / Math.max(source.pop, 1) * 0.3 -
         resourceContext.disasterBurden * 0.48 -
         target.pressures.health * 0.24 -
@@ -1716,11 +1925,12 @@ function applyTribePhase(
         mobility * 0.08 -
         (source.statusFlags.migrating ? 0.2 : 0) -
         (tile.terrain === 'desert' || tile.terrain === 'mountain' ? 0.12 : tile.terrain === 'highland' ? 0.02 : 0)) *
-      1.08 *
-      intensifyAdjustment;
+      0.0008 *
+      intensifyAdjustment *
+      agricultureEraFactor(write.year);
 
     target.development.domestication = round(
-      clamp(source.development.domestication + progressDelta, 0, 100),
+      clamp(source.development.domestication + progressDelta, 0, domesticationEraCeiling(write.year)),
       2,
     );
     target.development.agricultureStage = resolveAgricultureStage(
@@ -1754,21 +1964,22 @@ function applyTribePhase(
 
     const stageProfile = getStageProfile(target.development.agricultureStage);
     const carryingCapacity = resourceContext.carryingCapacity;
+    const rawFoodBalance = resourceContext.effectiveFood / Math.max(source.pop, 1) - 1.0;
     const foodMultiplier = clamp(
-      1 - target.pressures.food * 0.78 + source.exchange.tradeVolume * 0.08,
-      0.08,
-      1.25,
+      1 - target.pressures.food * 0.84 + source.exchange.tradeVolume * 0.05,
+      0.1,
+      1.08,
     );
     const comfortMultiplier = clamp(
-      1 - (target.pressures.heat + target.pressures.cold) * 0.3 - target.pressures.health * 0.12,
-      0.42,
-      1.12,
+      1 - (target.pressures.heat + target.pressures.cold) * 0.32 - target.pressures.health * 0.14,
+      0.45,
+      1.06,
     );
     const orgMultiplier =
       1 +
-      (target.abilities.organization.current + stageProfile.organizationBonus) / 215 +
-      (leaderModifiers.cohesion - 1) * 0.1;
-    const fertilityBoost = 1 + stageProfile.birthBonus + source.exchange.tradeVolume * 0.05;
+      (target.abilities.organization.current + stageProfile.organizationBonus) / 320 +
+      (leaderModifiers.cohesion - 1) * 0.06;
+    const fertilityBoost = 1 + stageProfile.birthBonus + source.exchange.tradeVolume * 0.03;
 
     // --- Inbreeding penalty from genetic diversity loss ---
     // Ne = effective population (~65% of census for hunter-gatherers)
@@ -1778,50 +1989,63 @@ function applyTribePhase(
     const inbreedingCoeff = 1 - source.geneticDiversity;
     const inbreedingPenalty = GENETIC_LETHAL_EQUIVALENTS * inbreedingCoeff * 0.0034;
 
-    // --- Intrinsic growth rate: maximum potential under current conditions ---
-    // Density effects come ONLY from logistic/Allee terms, not baked into rBase.
-    // Cap at 0.04 (~4% potential) so that after logistic damping, the effective
-    // rate near K/2 is ~0.02 (2%), matching ethnographic short-term HG growth.
-    // Long-run average of ~0.04% emerges from periodic crashes (disasters, disease, conflict).
+    const techHealthBonus = getTechHealthBonus(target.knownTechnologies);
+    const recoveryUpside =
+      Math.max(0, rawFoodBalance) * 0.002 +
+      Math.max(0, 0.34 - target.pressures.total) * 0.0015 +
+      Math.max(0, source.foodStores - 0.22) * 0.001 +
+      Math.max(0, source.exchange.tradeVolume - 0.1) * 0.0005;
     const rBase = clamp(
       config.globals.G_birth *
         foodMultiplier *
         comfortMultiplier *
         orgMultiplier *
         fertilityBoost -
-      config.globals.G_death -
+      config.globals.G_death +
+      techHealthBonus * 0.22 +
+      recoveryUpside -
       inbreedingPenalty -
-      target.pressures.health * 0.015 -
-      resourceContext.disasterBurden * 0.01,
-      -0.1,
-      0.04,
+      target.pressures.health * 0.016 -
+      resourceContext.disasterBurden * 0.011 -
+      resourceContext.plagueBurden * 0.015 -
+      resourceContext.resourceCollapse * 0.01 -
+      Math.max(0, 0.22 - source.foodStores) * 0.011,
+      -0.09,
+      0.012,
     );
 
-    // Allee effect: below ALLEE_THRESHOLD (~25), growth goes strongly negative
     const alleeMultiplier =
       source.pop <= 0 ? 0 : Math.max(-1, (source.pop - ALLEE_THRESHOLD) / source.pop);
 
-    // Logistic ceiling: slows growth as pop approaches K
-    const logisticMultiplier = clamp(1 - source.pop / Math.max(carryingCapacity, 1), -0.5, 1);
+    const logisticMultiplier = clamp(
+      1 - source.pop / Math.max(carryingCapacity, 1),
+      -0.4,
+      1,
+    );
 
-    // Combined growth: r * (1-N/K) * max(0, (N-A)/N)
     const growthFactor = rBase * logisticMultiplier * alleeMultiplier;
 
     // --- Food stores buffer: reduces starvation death during bad years ---
-    const foodStoresBuffer = clamp(resourceContext.effectiveStoredFood / Math.max(source.pop, 1), 0, 0.34);
-    const starvationDamper = target.pressures.food > 0.3 && foodStoresBuffer > 0
-      ? clamp(1 - foodStoresBuffer * 0.9, 0.34, 1)
+    const techStorageBonus = getTechFoodStorageBonus(target.knownTechnologies);
+    const foodStoresBuffer = clamp((resourceContext.effectiveStoredFood / Math.max(source.pop, 1)) + techStorageBonus, 0, 0.5);
+    const starvationDamper = target.pressures.food > 0.35 && foodStoresBuffer > 0
+      ? clamp(1 - foodStoresBuffer * 1.2, 0.25, 1)
       : 1;
 
     // --- Extra pressure deaths (only severe conditions, buffered by stores) ---
     const pressureDeathRate = clamp(
-      Math.max(0, target.pressures.food - 0.38) * 0.034 +
-        Math.max(0, target.pressures.water - 0.4) * 0.04 +
-        source.exchange.raidExposure * 0.022 +
-        source.exchange.warExhaustion * 0.018 +
-        resourceContext.geneticRisk * 0.01,
+      Math.max(0, target.pressures.food - 0.42) * 0.03 +
+        Math.max(0, target.pressures.water - 0.46) * 0.034 +
+        Math.max(0, target.pressures.health - 0.26) * 0.024 +
+        Math.max(0, target.pressures.competition - 0.4) * 0.014 +
+        Math.max(0, -rawFoodBalance) * 0.034 +
+        resourceContext.plagueBurden * 0.016 +
+        resourceContext.disasterBurden * 0.009 +
+        source.exchange.raidExposure * 0.018 +
+        source.exchange.warExhaustion * 0.015 +
+        resourceContext.geneticRisk * 0.0075,
       0,
-      0.075,
+      0.072,
     ) * starvationDamper;
 
     const previousCarry = populationCarry.get(target.id) ?? 0;
@@ -1836,16 +2060,31 @@ function applyTribePhase(
     target.statusFlags.recovering = target.pop > source.pop;
 
     // --- Update food stores ---
-    const rawFoodBalance = resourceContext.effectiveFood / Math.max(source.pop, 1) - 1.0;
-    const storesAccumRate = stageProfile.targetSedentism > 0.3 ? 0.12 : 0.08;
-    const storesGain = Math.max(0, rawFoodBalance) * storesAccumRate * (0.82 + target.abilities.organization.current / 220);
+    const storageCap = clamp(
+      0.18 +
+        stageProfile.targetSedentism * 0.62 +
+        techStorageBonus * 1.7 +
+        target.abilities.organization.current / 600,
+      0.22,
+      0.92,
+    );
+    const storesAccumRate = stageProfile.targetSedentism > 0.3 ? 0.08 : 0.035;
+    const storesGain =
+      Math.max(0, rawFoodBalance) *
+      storesAccumRate *
+      (0.74 + target.abilities.organization.current / 240) *
+      clamp(storageCap - source.foodStores + 0.12, 0.12, 1);
     const storesDraw =
       Math.max(0, -rawFoodBalance) *
-        (0.2 + mobility * 0.08 + resourceContext.disasterBurden * 0.08 + target.pressures.food * 0.06) +
-      source.exchange.raidExposure * 0.02 +
-      source.exchange.warExhaustion * 0.015;
+        (0.36 +
+          mobility * 0.14 +
+          resourceContext.disasterBurden * 0.16 +
+          resourceContext.plagueBurden * 0.08 +
+          target.pressures.food * 0.14) +
+      source.exchange.raidExposure * 0.032 +
+      source.exchange.warExhaustion * 0.026;
     target.foodStores = round(
-      clamp(source.foodStores + storesGain - storesDraw, 0, 1),
+      clamp(source.foodStores + storesGain - storesDraw, 0, storageCap),
       3,
     );
 
@@ -1853,24 +2092,25 @@ function applyTribePhase(
     // Drift accelerates in tiny isolated bands and slows with durable exchange/alliance contact.
     const generationLength = 25;
     const contactBuffer = clamp(
-      source.alliances.length * 0.06 + source.exchange.tradeVolume * 0.18 + source.exchange.diffusion * 0.1,
+      source.alliances.length * 0.09 + source.exchange.tradeVolume * 0.24 + source.exchange.diffusion * 0.16,
       0,
-      0.45,
+      0.62,
     );
-    const isolationFactor = clamp(1.12 - contactBuffer + Math.max(0, 60 - source.pop) / 200, 0.35, 1.28);
+    const isolationFactor = clamp(1.0 - contactBuffer + Math.max(0, 55 - source.pop) / 260, 0.22, 1.12);
     const nextF =
       inbreedingCoeff +
       ((1 - inbreedingCoeff) / Math.max(2 * Ne * generationLength, 2)) * isolationFactor;
-    target.geneticDiversity = round(clamp(1 - nextF, 0, 1), 4);
+    const diversityExchangeBoost = clamp(contactBuffer * 0.018 + (source.pop >= 70 ? 0.003 : 0), 0, 0.02);
+    target.geneticDiversity = round(clamp(1 - nextF + diversityExchangeBoost, 0, 1), 4);
 
     // --- Storyteller recovery boost ---
     const recoveryMod = write.storyteller.recoveryMultiplier;
 
     target.exchange = {
-      tradeVolume: round(clamp(source.exchange.tradeVolume * (0.56 + recoveryMod * 0.03), 0, 1.5), 3),
-      diffusion: round(clamp(source.exchange.diffusion * (0.5 + recoveryMod * 0.03), 0, 1.5), 3),
-      raidExposure: round(clamp(source.exchange.raidExposure * 0.42, 0, 1.5), 3),
-      warExhaustion: round(clamp(source.exchange.warExhaustion * 0.72, 0, 1.5), 3),
+      tradeVolume: round(clamp(source.exchange.tradeVolume * (0.93 + recoveryMod * 0.01), 0, 1.5), 3),
+      diffusion: round(clamp(source.exchange.diffusion * (0.91 + recoveryMod * 0.01), 0, 1.5), 3),
+      raidExposure: round(clamp(source.exchange.raidExposure * 0.7, 0, 1.5), 3),
+      warExhaustion: round(clamp(source.exchange.warExhaustion * 0.74, 0, 1.5), 3),
     };
 
     const growthSignal = (target.pop - source.pop) / Math.max(source.pop, 1);
@@ -1903,10 +2143,10 @@ function applyTribePhase(
     const huntPressure = load.foraging / Math.max(tile.carryingCapacity.hunt, 1);
     const agriPressure = load.farming / Math.max(tile.carryingCapacity.agri, 1);
     const huntDepletion =
-      load.foraging * (0.0056 + load.mobility * 0.00026) +
-      Math.max(0, huntPressure - 0.78) * tile.carryingCapacity.hunt * (0.016 + load.crowding * 0.002);
+      load.foraging * (0.002 + load.mobility * 0.0001) +
+      Math.max(0, huntPressure - 0.85) * tile.carryingCapacity.hunt * (0.006 + load.crowding * 0.001);
     const agriDepletion =
-      load.farming * 0.0042 + Math.max(0, agriPressure - 1) * tile.carryingCapacity.agri * 0.009;
+      load.farming * 0.0015 + Math.max(0, agriPressure - 1.1) * tile.carryingCapacity.agri * 0.004;
 
     writeTile.carryingCapacity.hunt = round(
       clamp(
@@ -1976,10 +2216,13 @@ function applyInteractionPhase(
   decisionPolicy: LearnedDecisionPolicy | null,
 ) {
   const readTileMap = tilesById(read);
+  const readTribeMap = tribesById(read);
   const writeTribeMap = tribesById(write);
   const tileToTribes = new Map<string, TribeState[]>();
   for (const tribe of read.tribes) {
-    tileToTribes.set(tribe.tileId, [...(tileToTribes.get(tribe.tileId) ?? []), tribe]);
+    const list = tileToTribes.get(tribe.tileId);
+    if (list) list.push(tribe);
+    else tileToTribes.set(tribe.tileId, [tribe]);
   }
 
   const pairs: InteractionPair[] = [];
@@ -2011,8 +2254,8 @@ function applyInteractionPhase(
   const storytellerPressure = storytellerCrisisSignal(read.storyteller);
 
   for (const pair of pairs) {
-    const readLeft = read.tribes.find((tribe) => tribe.id === pair.leftId);
-    const readRight = read.tribes.find((tribe) => tribe.id === pair.rightId);
+    const readLeft = readTribeMap.get(pair.leftId);
+    const readRight = readTribeMap.get(pair.rightId);
     const left = writeTribeMap.get(pair.leftId);
     const right = writeTribeMap.get(pair.rightId);
     if (!readLeft || !readRight || !left || !right || left.pop <= 0 || right.pop <= 0) {
@@ -2080,8 +2323,8 @@ function applyInteractionPhase(
       applyDiffusion(right, left, totalFlow / 15);
 
       // Genetic rescue through durable exchange and alliance contact.
-      if (totalFlow > 1.4 || alliedBefore) {
-        const rescueRate = alliedBefore ? 0.03 : totalFlow > 3 ? 0.024 : 0.016;
+      if (totalFlow > 1.1 || alliedBefore || (pair.sharedTile && relationBefore > 0.22)) {
+        const rescueRate = alliedBefore ? 0.04 : totalFlow > 3 ? 0.03 : pair.sharedTile ? 0.018 : 0.014;
         const leftBefore = left.geneticDiversity;
         const rightBefore = right.geneticDiversity;
         left.geneticDiversity = round(clamp(
@@ -2090,17 +2333,94 @@ function applyInteractionPhase(
           rightBefore + (leftBefore - rightBefore) * rescueRate, 0, 1), 4);
       }
 
-      if (stageRank(readRight.development.agricultureStage) > stageRank(readLeft.development.agricultureStage)) {
-        left.development.domestication = round(clamp(left.development.domestication + totalFlow / 7.5, 0, 100), 2);
+      const domesticationTransfer =
+        (totalFlow / 20) *
+        agricultureEraFactor(write.year) *
+        clamp(0.65 + relationBefore, 0.3, 1.4);
+      if (stageRank(readRight.development.agricultureStage) > stageRank(readLeft.development.agricultureStage) && relationBefore > 0.08) {
+        left.development.domestication = round(
+          clamp(left.development.domestication + domesticationTransfer, 0, domesticationEraCeiling(write.year)),
+          2,
+        );
       }
-      if (stageRank(readLeft.development.agricultureStage) > stageRank(readRight.development.agricultureStage)) {
-        right.development.domestication = round(clamp(right.development.domestication + totalFlow / 7.5, 0, 100), 2);
+      if (stageRank(readLeft.development.agricultureStage) > stageRank(readRight.development.agricultureStage) && relationBefore > 0.08) {
+        right.development.domestication = round(
+          clamp(right.development.domestication + domesticationTransfer, 0, domesticationEraCeiling(write.year)),
+          2,
+        );
+      }
+
+      // --- Tech spread via trade ---
+      if (totalFlow > 4.6 && relationBefore > 0.08) {
+        const spreadChance = clamp(
+          totalFlow *
+            0.0012 *
+            innovationEraFactor(write.year) *
+            (alliedBefore ? 1.18 : pair.sharedTile ? 0.94 : 0.72) *
+            clamp(
+              0.42 +
+                relationBefore +
+                safeAverage([readLeft.exchange.diffusion, readRight.exchange.diffusion]) * 0.4,
+              0.18,
+              1.2,
+            ),
+          0,
+          0.018,
+        );
+        for (const techId of readRight.knownTechnologies) {
+          if (!left.knownTechnologies.includes(techId) && hasAllPrerequisites(left.knownTechnologies, techId)) {
+            const spreadResistance = technologyRegionalism(techId) * technologyComplexity(techId);
+            if (prng.next() < (spreadChance * TECH_TREE[techId].spreadWeight) / spreadResistance) {
+              left.knownTechnologies = [...left.knownTechnologies, techId];
+              const tech = TECH_TREE[techId];
+              for (const [ability, bonus] of Object.entries(tech.effects)) {
+                const a = ability as AbilityKey;
+                left.abilities[a].cap = clamp(left.abilities[a].cap + (bonus as number), 0, 100);
+                left.abilities[a].current = clamp(left.abilities[a].current + (bonus as number), 0, 100);
+              }
+              events.push({
+                id: eventId('innovation', write.year, events.length),
+                year: write.year,
+                kind: 'innovation',
+                title: `${left.name} adopted ${tech.name}`,
+                detail: `${left.name} learned ${tech.name} through trade with ${right.name}.`,
+                tribeId: left.id,
+                tileId: left.tileId,
+              });
+              break;
+            }
+          }
+        }
+        for (const techId of readLeft.knownTechnologies) {
+          if (!right.knownTechnologies.includes(techId) && hasAllPrerequisites(right.knownTechnologies, techId)) {
+            const spreadResistance = technologyRegionalism(techId) * technologyComplexity(techId);
+            if (prng.next() < (spreadChance * TECH_TREE[techId].spreadWeight) / spreadResistance) {
+              right.knownTechnologies = [...right.knownTechnologies, techId];
+              const tech = TECH_TREE[techId];
+              for (const [ability, bonus] of Object.entries(tech.effects)) {
+                const a = ability as AbilityKey;
+                right.abilities[a].cap = clamp(right.abilities[a].cap + (bonus as number), 0, 100);
+                right.abilities[a].current = clamp(right.abilities[a].current + (bonus as number), 0, 100);
+              }
+              events.push({
+                id: eventId('innovation', write.year, events.length),
+                year: write.year,
+                kind: 'innovation',
+                title: `${right.name} adopted ${tech.name}`,
+                detail: `${right.name} learned ${tech.name} through trade with ${left.name}.`,
+                tribeId: right.id,
+                tileId: right.tileId,
+              });
+              break;
+            }
+          }
+        }
       }
 
       changedTribeIds.add(left.id);
       changedTribeIds.add(right.id);
 
-      if (totalFlow > 4.8 && (alliedBefore || prng.next() < 0.22 * tradeAdjustment)) {
+      if (totalFlow > 6.2 && (alliedBefore || prng.next() < 0.1 * tradeAdjustment)) {
         events.push({
           id: eventId('trade', write.year, events.length),
           year: write.year,
@@ -2152,7 +2472,11 @@ function applyInteractionPhase(
       relationAfter > 0.48 &&
       totalFlow > 2.2 &&
       pairCompetition < 0.62 &&
-      prng.next() < 0.024 * (leftLeader.diplomacy + rightLeader.diplomacy) * allianceAdjustment
+      prng.next() <
+        0.024 *
+          (leftLeader.diplomacy + rightLeader.diplomacy) *
+          (1 + safeAverage([1 - readLeft.geneticDiversity, 1 - readRight.geneticDiversity]) * 0.7) *
+          allianceAdjustment
     ) {
       addAlliance(writeTribeMap, left.id, right.id);
       setRelationship(writeTribeMap, left.id, right.id, relationAfter + 0.1);
@@ -2187,38 +2511,47 @@ function applyInteractionPhase(
       });
     }
 
-    const exposureScale = 1 - Math.max(exposure.get(left.id) ?? 0, exposure.get(right.id) ?? 0) * 0.5;
+    const exposureScale = 1 - Math.max(exposure.get(left.id) ?? 0, exposure.get(right.id) ?? 0) * 0.62;
+    const fragilityBrake =
+      clamp(Math.min(readLeft.pop, readRight.pop) / 110, 0.22, 1) *
+      clamp(safeAverage([readLeft.geneticDiversity, readRight.geneticDiversity]) + 0.15, 0.35, 1.1);
+    const scarcityTension =
+      (readLeft.pressures.food + readRight.pressures.food) * 0.09 +
+      (readLeft.pressures.water + readRight.pressures.water) * 0.035 +
+      (Math.max(0, 0.32 - readLeft.foodStores) + Math.max(0, 0.32 - readRight.foodStores)) * 0.08;
     const hostility =
-      config.globals.G_hostility * 0.42 +
-      pairCompetition * (0.26 + pairMobility * 0.1) +
-      (readLeft.pressures.food + readRight.pressures.food) * 0.18 +
-      (readLeft.pressures.water + readRight.pressures.water) * 0.08 +
-      storytellerPressure * 0.1 +
-      Math.max(0, -relationAfter) * 0.4 +
-      (readLeft.abilities.attack.current + readRight.abilities.attack.current) / 230 -
-      totalFlow * 0.05 -
-      (hasAlliance(left, right.id) || hasAlliance(right, left.id) ? 0.7 : 0);
+      config.globals.G_hostility * 0.18 +
+      pairCompetition * (0.12 + pairMobility * 0.04) +
+      scarcityTension +
+      storytellerPressure * 0.05 +
+      Math.max(0, -relationAfter) * 0.3 +
+      (readLeft.abilities.attack.current + readRight.abilities.attack.current) / 380 -
+      totalFlow * 0.1 -
+      (readLeft.exchange.tradeVolume + readRight.exchange.tradeVolume) * 0.04 -
+      (hasAlliance(left, right.id) || hasAlliance(right, left.id) ? 0.75 : 0);
 
+    const fatigueLeft = readLeft.exchange.raidExposure * 0.1 + readLeft.exchange.warExhaustion * 0.12;
+    const fatigueRight = readRight.exchange.raidExposure * 0.1 + readRight.exchange.warExhaustion * 0.12;
     const aggressionLeft =
-      readLeft.pressures.food * 0.48 +
-      readLeft.pressures.competition * (0.42 + mobilityProfile(readLeft) * 0.1) +
-      Math.max(0, 0.3 - readLeft.foodStores) * 0.32 +
-      (1 - readLeft.geneticDiversity) * 0.08 +
-      readLeft.abilities.attack.current / 145 +
-      leftLeader.raidBias +
-      readLeft.exchange.raidExposure * 0.09 -
-      readLeft.exchange.tradeVolume * 0.04 -
-      (readLeft.leader?.legitimacy ?? 0.55) * 0.06;
+      readLeft.pressures.food * 0.24 +
+      readLeft.pressures.competition * (0.2 + mobilityProfile(readLeft) * 0.05) +
+      Math.max(0, 0.26 - readLeft.foodStores) * 0.14 +
+      (1 - readLeft.geneticDiversity) * 0.03 +
+      readLeft.abilities.attack.current / 260 +
+      leftLeader.raidBias * 0.55 -
+      readLeft.exchange.tradeVolume * 0.08 -
+      fatigueLeft -
+      (readLeft.leader?.legitimacy ?? 0.55) * 0.08;
     const aggressionRight =
-      readRight.pressures.food * 0.48 +
-      readRight.pressures.competition * (0.42 + mobilityProfile(readRight) * 0.1) +
-      Math.max(0, 0.3 - readRight.foodStores) * 0.32 +
-      (1 - readRight.geneticDiversity) * 0.08 +
-      readRight.abilities.attack.current / 145 +
-      rightLeader.raidBias +
-      readRight.exchange.raidExposure * 0.09 -
-      readRight.exchange.tradeVolume * 0.04 -
-      (readRight.leader?.legitimacy ?? 0.55) * 0.06;
+      readRight.pressures.food * 0.24 +
+      readRight.pressures.competition * (0.2 + mobilityProfile(readRight) * 0.05) +
+      Math.max(0, 0.26 - readRight.foodStores) * 0.14 +
+      (1 - readRight.geneticDiversity) * 0.03 +
+      readRight.abilities.attack.current / 260 +
+      rightLeader.raidBias * 0.55 -
+      readRight.exchange.tradeVolume * 0.08 -
+      fatigueRight -
+      (readRight.leader?.legitimacy ?? 0.55) * 0.08;
 
     if (!(hasAlliance(left, right.id) || hasAlliance(right, left.id))) {
       const leftTile = readTileMap.get(left.tileId)!;
@@ -2260,7 +2593,17 @@ function applyInteractionPhase(
         ),
       });
       const raidAdjustment = decisionAdjustment(decisionPolicy, 'raid', raidFeatures, 0.38);
-      const raidChance = clamp((hostility + Math.max(aggressionLeft, aggressionRight)) * 0.084 * exposureScale * raidAdjustment, 0, 0.34);
+      const raidPressure =
+        hostility * 0.74 +
+        Math.max(aggressionLeft, aggressionRight) * 0.62 +
+        pairCompetition * 0.12 -
+        totalFlow * 0.06 -
+        Math.min(readLeft.foodStores, readRight.foodStores) * 0.1;
+      const raidChance = clamp(
+        Math.max(0, raidPressure - 0.42) * 0.028 * exposureScale * raidAdjustment * fragilityBrake,
+        0,
+        0.09,
+      );
       if (prng.next() < raidChance) {
         const attacker = aggressionLeft >= aggressionRight ? left : right;
         const defender = attacker.id === left.id ? right : left;
@@ -2299,6 +2642,30 @@ function applyInteractionPhase(
         defender.pop = clamp(defender.pop - defenderLoss, 0, MAX_TRIBE_POPULATION);
         attacker.exchange.tradeVolume = round(clamp(attacker.exchange.tradeVolume + loot / 18, 0, 1.5), 3);
         attacker.exchange.warExhaustion = round(clamp(attacker.exchange.warExhaustion + 0.08, 0, 1.5), 3);
+        // Tech looting: attacker may capture defender's technology
+        if (prng.next() < 0.018) {
+          const readDefender = readTribeMap.get(defender.id);
+          if (readDefender) {
+            for (const techId of readDefender.knownTechnologies) {
+              const tech = TECH_TREE[techId];
+              if (!tech) {
+                continue;
+              }
+              if (tech.category === 'knowledge' && prng.next() < 0.72) {
+                continue;
+              }
+              if (!attacker.knownTechnologies.includes(techId) && hasAllPrerequisites(attacker.knownTechnologies, techId)) {
+                attacker.knownTechnologies = [...attacker.knownTechnologies, techId];
+                for (const [ability, bonus] of Object.entries(tech.effects)) {
+                  const a = ability as AbilityKey;
+                  attacker.abilities[a].cap = clamp(attacker.abilities[a].cap + (bonus as number), 0, 100);
+                  attacker.abilities[a].current = clamp(attacker.abilities[a].current + (bonus as number), 0, 100);
+                }
+                break;
+              }
+            }
+          }
+        }
         applyDefeatShock(attacker, Math.max(attackerLoss / Math.max(attacker.pop + attackerLoss, 1), 0.05), false);
         applyDefeatShock(defender, Math.max(defenderLoss / Math.max(defender.pop + defenderLoss, 1), 0.12), true);
         setRelationship(writeTribeMap, attacker.id, defender.id, relationAfter - 0.24);
@@ -2316,9 +2683,19 @@ function applyInteractionPhase(
           tileId: attacker.tileId,
         });
       } else if (pair.sharedTile) {
-        const battleChance = clamp((hostility + Math.max(0, -relationAfter) * 0.24) * 0.092 * exposureScale * (0.92 + pairMobility * 0.24), 0, 0.28);
+        const battlePressure =
+          hostility +
+          Math.max(0, -relationAfter) * 0.24 +
+          pairCompetition * 0.12 -
+          totalFlow * 0.08 -
+          safeAverage([readLeft.foodStores, readRight.foodStores]) * 0.18;
+        const battleChance = clamp(
+          Math.max(0, battlePressure - 0.5) * 0.034 * exposureScale * (0.84 + pairMobility * 0.12) * fragilityBrake,
+          0,
+          0.08,
+        );
         if (prng.next() < battleChance) {
-          const intensity = clamp(0.038 + hostility * 0.06 + pairCompetition * 0.025, 0.04, 0.15);
+          const intensity = clamp(0.018 + hostility * 0.026 + pairCompetition * 0.014, 0.02, 0.072);
           const leftLoss = Math.min(
             Math.max(left.pop - 1, 0),
             Math.round(left.pop * intensity * rightStrength / Math.max(leftStrength + rightStrength, 1)),
@@ -2372,6 +2749,43 @@ function applyInteractionPhase(
   }
 }
 
+
+function corridorAffinity(tile: TileState) {
+  return clamp(
+    (tile.movementTags.includes('river-corridor') ? 0.34 : 0) +
+      (tile.movementTags.includes('coastal-corridor') ? 0.22 : 0) +
+      (tile.movementTags.includes('steppe-corridor') ? 0.18 : 0) +
+      (tile.movementTags.includes('desert-pass') ? 0.12 : 0) +
+      (tile.movementTags.includes('mountain-pass') ? 0.14 : 0) +
+      (tile.movementTags.includes('land-bridge') ? 0.1 : 0),
+    0,
+    1.2,
+  );
+}
+
+function computeRegionalDensity(tileToTribes: Map<string, TribeState[]>, tiles: Map<string, TileState>) {
+  const regionalTribeCount = new Map<string, number>();
+  for (const [tileId, tribesOnTile] of tileToTribes) {
+    const count = tribesOnTile.length;
+    const tile = tiles.get(tileId);
+    if (!tile) continue;
+    regionalTribeCount.set(tileId, (regionalTribeCount.get(tileId) ?? 0) + count);
+    for (const n1 of tile.neighbors) {
+      regionalTribeCount.set(n1, (regionalTribeCount.get(n1) ?? 0) + count);
+      const n1Tile = tiles.get(n1);
+      if (n1Tile) {
+        for (const n2 of n1Tile.neighbors) {
+          if (n2 !== tileId) {
+            regionalTribeCount.set(n2, (regionalTribeCount.get(n2) ?? 0) + count);
+          }
+        }
+      }
+    }
+  }
+  return regionalTribeCount;
+}
+
+
 function applyMigrationPhase(
   read: WorldState,
   write: WorldState,
@@ -2382,90 +2796,304 @@ function applyMigrationPhase(
   decisionPolicy: LearnedDecisionPolicy | null,
 ) {
   const readTiles = tilesById(read);
+  const readTribeMap = tribesById(read);
   const writeTribes = tribesById(write);
   const occupancy = occupancyByTile(read);
   const storytellerPressure = storytellerCrisisSignal(read.storyteller);
+  const tileToTribes = new Map<string, TribeState[]>();
+  for (const tribe of read.tribes) {
+    const list = tileToTribes.get(tribe.tileId);
+    if (list) list.push(tribe);
+    else tileToTribes.set(tribe.tileId, [tribe]);
+  }
+
+  const regionalTribeCount = computeRegionalDensity(tileToTribes, readTiles);
+
+  function tileTraversalCost(tile: TileState) {
+    // Sea is impassable unless it's a strait
+    if (tile.terrain === 'sea') {
+      return tile.movementTags.includes('strait') ? 1.8 : Infinity;
+    }
+    let cost = 1;
+    if (tile.terrain === 'river_valley') {
+      cost = 0.34;
+    } else if (tile.terrain === 'coast') {
+      cost = 0.52;
+    } else if (tile.terrain === 'plains' || tile.terrain === 'forest') {
+      cost = 0.86;
+    } else if (tile.terrain === 'savanna') {
+      cost = 0.92;
+    } else if (tile.terrain === 'steppe') {
+      cost = 0.76;
+    } else if (tile.terrain === 'highland') {
+      cost = 1.08;
+    } else if (tile.terrain === 'desert') {
+      cost = 1.26;
+    } else if (tile.terrain === 'mountain') {
+      cost = 1.72;
+    }
+
+    cost -= corridorAffinity(tile) * 0.26;
+    if (tile.movementTags.includes('desert-pass')) {
+      cost -= 0.12;
+    }
+    if (tile.movementTags.includes('mountain-pass')) {
+      cost -= 0.22;
+    }
+    return clamp(cost, 0.22, 2.1);
+  }
+
+  function gatherTilePaths(startId: string, maxSteps: number) {
+    // Binary min-heap keyed on (cost + steps * 0.04)
+    type FrontierNode = { tileId: string; cost: number; steps: number; key: number };
+    const heap: FrontierNode[] = [];
+
+    function heapPush(node: FrontierNode) {
+      heap.push(node);
+      let i = heap.length - 1;
+      while (i > 0) {
+        const parent = (i - 1) >> 1;
+        if (heap[parent].key <= node.key) break;
+        heap[i] = heap[parent];
+        i = parent;
+      }
+      heap[i] = node;
+    }
+
+    function heapPop(): FrontierNode {
+      const top = heap[0];
+      const last = heap.pop()!;
+      if (heap.length > 0) {
+        heap[0] = last;
+        let i = 0;
+        const len = heap.length;
+        while (true) {
+          let smallest = i;
+          const l = 2 * i + 1;
+          const r = 2 * i + 2;
+          if (l < len && heap[l].key < heap[smallest].key) smallest = l;
+          if (r < len && heap[r].key < heap[smallest].key) smallest = r;
+          if (smallest === i) break;
+          [heap[i], heap[smallest]] = [heap[smallest], heap[i]];
+          i = smallest;
+        }
+      }
+      return top;
+    }
+
+    const best = new Map<string, { cost: number; steps: number; previous: string | null }>([
+      [startId, { cost: 0, steps: 0, previous: null }],
+    ]);
+    heapPush({ tileId: startId, cost: 0, steps: 0, key: 0 });
+
+    while (heap.length) {
+      const current = heapPop();
+      const currentTile = readTiles.get(current.tileId);
+      if (!currentTile || current.steps >= maxSteps) {
+        continue;
+      }
+
+      for (const neighborId of currentTile.neighbors) {
+        const neighbor = readTiles.get(neighborId);
+        if (!neighbor) {
+          continue;
+        }
+        // Skip impassable sea tiles (straits are allowed)
+        if (neighbor.terrain === 'sea' && !neighbor.movementTags.includes('strait')) {
+          continue;
+        }
+
+        const nextSteps = current.steps + 1;
+        const nextCost = current.cost + tileTraversalCost(neighbor);
+        const previous = best.get(neighborId);
+        if (
+          previous &&
+          (previous.cost < nextCost - 0.01 ||
+            (Math.abs(previous.cost - nextCost) <= 0.01 && previous.steps <= nextSteps))
+        ) {
+          continue;
+        }
+
+        best.set(neighborId, { cost: nextCost, steps: nextSteps, previous: current.tileId });
+        heapPush({ tileId: neighborId, cost: nextCost, steps: nextSteps, key: nextCost + nextSteps * 0.04 });
+      }
+    }
+
+    return best;
+  }
+
+  function recoverPath(
+    startId: string,
+    targetId: string,
+    best: Map<string, { cost: number; steps: number; previous: string | null }>,
+  ) {
+    const path: string[] = [];
+    let currentId: string | null = targetId;
+    while (currentId) {
+      path.push(currentId);
+      const node = best.get(currentId);
+      currentId = node?.previous ?? null;
+    }
+    path.reverse();
+    return path[0] === startId ? path : [];
+  }
+
+  function applyMovementCosts(target: TribeState, nextTile: TileState, movingFar: boolean) {
+    const corridorSupport = corridorAffinity(nextTile);
+    const domesticationLoss = movingFar ? 2.2 : 1.05;
+    const sedentismLoss = movingFar ? 0.92 : 0.965;
+    target.development.domestication = round(
+      clamp(
+        target.development.domestication -
+          target.development.sedentism * domesticationLoss -
+          stageRank(target.development.agricultureStage) * (movingFar ? 0.24 : 0.08) +
+          corridorSupport * 0.42,
+        0,
+        100,
+      ),
+      2,
+    );
+    target.development.sedentism = round(clamp(target.development.sedentism * sedentismLoss, 0.02, 0.94), 3);
+    target.exchange.tradeVolume = round(
+      clamp(target.exchange.tradeVolume * (movingFar ? 0.8 : 0.88) + corridorSupport * 0.04, 0, 1.5),
+      3,
+    );
+    target.foodStores = round(
+      clamp(target.foodStores * (movingFar ? 0.72 : 0.84) + corridorSupport * 0.03, 0, 1),
+      3,
+    );
+  }
+
+  function clearMigrationPlan(target: TribeState, settle: boolean) {
+    target.migration.destinationTileId = null;
+    target.migration.plannedRouteTileIds = [];
+    target.migration.commitmentYears = 0;
+    if (settle) {
+      target.migration.homeTileId = target.tileId;
+      target.migration.cooldownYears = Math.max(
+        target.migration.cooldownYears,
+        4 + Math.round(target.development.sedentism * 5) + Math.round(stageRank(target.development.agricultureStage) * 3),
+      );
+    }
+  }
 
   for (const tribe of read.tribes) {
+    const target = writeTribes.get(tribe.id)!;
     const leaderModifiers = getLeaderModifiers(tribe.leader);
     const stageProfile = getStageProfile(tribe.development.agricultureStage);
     const currentTile = readTiles.get(tribe.tileId)!;
     const currentRisk =
       sumDisasterSeverity(currentTile) +
       sumPlagueSeverity(currentTile) +
-      tribe.exchange.raidExposure * 0.8 +
-      tribe.exchange.warExhaustion * 0.6;
+      tribe.exchange.raidExposure * 0.78 +
+      tribe.exchange.warExhaustion * 0.58;
     const defeatVulnerability = clamp(
-      tribe.exchange.raidExposure * 0.55 +
+      tribe.exchange.raidExposure * 0.52 +
         tribe.exchange.warExhaustion * 0.4 +
-        Math.max(0, 0.4 - tribe.foodStores) * 0.4,
+        Math.max(0, 0.42 - tribe.foodStores) * 0.38,
       0,
       1.2,
     );
     const migrationPressure = Math.max(
       tribe.pressures.total,
-      tribe.pressures.food * 1.26,
-      tribe.pressures.water * 1.18,
-      tribe.pressures.health * 1.08,
-      tribe.pressures.competition * 1.28,
-      currentRisk * 0.82,
-      defeatVulnerability * 0.74,
+      tribe.pressures.food * 1.24,
+      tribe.pressures.water * 1.15,
+      tribe.pressures.health * 1.05,
+      tribe.pressures.competition * 1.22,
+      currentRisk * 0.88,
+      defeatVulnerability * 0.76,
     );
     const mobility = mobilityProfile(tribe);
+    const coastalForaging = tribe.development.agricultureStage === 'foraging' || tribe.development.agricultureStage === 'tending';
+    // Regional density: how many tribes are within 2 hops (drives expansion pressure)
+    const localDensity = regionalTribeCount.get(currentTile.id) ?? 0;
+    const densityPush = clamp((localDensity - 4) / 12, 0, 1.0); // kicks in above 4 nearby tribes
     const frontierDrive = clamp(
-      tribe.pressures.competition * 1.02 +
-        tribe.pressures.food * 0.62 +
-        mobility * 0.26 +
-        storytellerPressure * 0.12,
+      tribe.pressures.competition * 0.92 +
+        tribe.pressures.food * 0.54 +
+        mobility * 0.18 +
+        storytellerPressure * 0.1 +
+        densityPush * 0.6,
       0,
       1.6,
     );
-    if (migrationPressure < 0.18 && frontierDrive < 0.3 && currentRisk < 0.28) {
+    const currentFood = getFoodCapacity(currentTile, coastalForaging);
+    const currentCrowding = (occupancy.get(currentTile.id) ?? 0) / Math.max(currentFood, 1);
+    const emergency =
+      migrationPressure > 0.56 ||
+      currentRisk > 0.46 ||
+      tribe.pressures.competition > 0.44 ||
+      tribe.pressures.food > 0.52;
+
+    if (tribe.migration.destinationTileId && tribe.migration.plannedRouteTileIds.length) {
+      const nextTileId = tribe.migration.plannedRouteTileIds[0];
+      const nextTile = readTiles.get(nextTileId);
+      if (nextTile && currentTile.neighbors.includes(nextTileId)) {
+        target.tileId = nextTileId;
+        target.statusFlags.migrating = true;
+        target.migration.destinationTileId = tribe.migration.destinationTileId;
+        target.migration.plannedRouteTileIds = tribe.migration.plannedRouteTileIds.slice(1);
+        target.migration.commitmentYears = Math.max(0, tribe.migration.commitmentYears - 1);
+        applyMovementCosts(target, nextTile, true);
+        if (
+          target.tileId === target.migration.destinationTileId ||
+          target.migration.plannedRouteTileIds.length === 0 ||
+          target.migration.commitmentYears === 0
+        ) {
+          clearMigrationPlan(target, true);
+        }
+        changedTribeIds.add(target.id);
+        events.push({
+          id: eventId('migration', write.year, events.length),
+          year: write.year,
+          kind: 'migration',
+          title: tribe.name + ' continued migrating',
+          detail:
+            tribe.name +
+            ' moved from ' +
+            currentTile.name +
+            ' to ' +
+            nextTile.name +
+            (tribe.migration.destinationTileId
+              ? ' while following a committed route toward ' +
+                (readTiles.get(tribe.migration.destinationTileId)?.name ?? 'a new settlement') +
+                '.'
+              : '.'),
+          tribeId: tribe.id,
+          tileId: nextTile.id,
+        });
+        continue;
+      }
+      clearMigrationPlan(target, false);
+    }
+
+    if (tribe.migration.cooldownYears > 0 && !emergency) {
       continue;
     }
 
-    const currentFood = getFoodCapacity(currentTile);
-    const currentCrowding = (occupancy.get(currentTile.id) ?? 0) / Math.max(currentFood, 1);
-    let bestTile = currentTile;
-    let bestScore = -999;
-    let bestFeatures = buildMigrationFeatures({
-      totalPressure: tribe.pressures.total,
-      foodPressure: tribe.pressures.food,
-      waterPressure: tribe.pressures.water,
-      competition: tribe.pressures.competition,
-      healthPressure: tribe.pressures.health,
-      currentRisk: clamp(currentRisk / 1.6, 0, 1.2),
-      sedentism: tribe.development.sedentism,
-      stage: tribe.development.agricultureStage,
-      resourceDelta: 0,
-      waterDelta: 0,
-      occupancyRelief: 0,
-      riskRelief: 0,
-      comfortDelta: 0,
-      frontier: 0,
-      ruggedness: terrainRuggedness(currentTile.terrain),
-      aridity: terrainAridity(currentTile.terrain),
-      alliedPresence: 0,
-      hostilePresence: 0,
-      resourceCollapse: foodCapacityCollapse(currentTile),
-      storedFood: clamp(tribe.foodStores, 0, 1.2),
-      geneticRisk: clamp(1 - tribe.geneticDiversity, 0, 1.2),
-      megafaunaDecline: clamp(1 - currentTile.megafaunaIndex, 0, 1.2),
-      storytellerCrisis: storytellerPressure,
-      defeatVulnerability,
-    });
+    if (migrationPressure < 0.14 && frontierDrive < 0.16 && currentRisk < 0.16) {
+      continue;
+    }
 
-    for (const neighborId of currentTile.neighbors) {
-      const neighbor = readTiles.get(neighborId)!;
-      const neighborFood = getFoodCapacity(neighbor);
-      const neighborCrowding = (occupancy.get(neighbor.id) ?? 0) / Math.max(neighborFood, 1);
+    const evaluateCandidate = (
+      candidate: TileState,
+      steps: number,
+      pathCost: number,
+      policyKind: 'local' | 'relocation',
+    ) => {
+      const neighborFood = getFoodCapacity(candidate, coastalForaging);
+      const neighborCrowding = (occupancy.get(candidate.id) ?? 0) / Math.max(neighborFood, 1);
       const neighborRisk =
-        sumDisasterSeverity(neighbor) +
-        sumPlagueSeverity(neighbor) +
-        tribe.exchange.raidExposure * 0.34 +
-        tribe.exchange.warExhaustion * 0.28;
-      const alliedPresence = alliedPresenceOnTile(tribe, neighbor.id, read.tribes);
-      const hostilePresence = hostilePresenceOnTile(tribe, neighbor.id, read.tribes);
+        sumDisasterSeverity(candidate) +
+        sumPlagueSeverity(candidate) +
+        tribe.exchange.raidExposure * 0.3 +
+        tribe.exchange.warExhaustion * 0.24;
+      const alliedPresence = alliedPresenceOnTile(tribe, candidate.id, readTribeMap);
+      const hostilePresence = hostilePresenceOnTile(tribe, candidate.id, tileToTribes);
+      const corridorSupport = corridorAffinity(candidate);
+      // Density at destination (lower = more attractive for expansion)
+      const destDensity = regionalTribeCount.get(candidate.id) ?? 0;
+      const densityRelief = clamp((localDensity - destDensity) / 10, -0.5, 1.0);
       const features = buildMigrationFeatures({
         totalPressure: tribe.pressures.total,
         foodPressure: tribe.pressures.food,
@@ -2475,111 +3103,217 @@ function applyMigrationPhase(
         currentRisk: clamp(currentRisk / 1.6, 0, 1.2),
         sedentism: tribe.development.sedentism,
         stage: tribe.development.agricultureStage,
-        resourceDelta: clamp((neighborFood - currentFood) / 200, -1.2, 1.2),
-        waterDelta: clamp((neighbor.water - currentTile.water) / 5.5, -1.2, 1.2),
-        occupancyRelief: clamp((currentCrowding - neighborCrowding) / 1.55, -1.2, 1.2),
-        riskRelief: clamp((currentRisk - neighborRisk) / 1.35, -1.2, 1.2),
-        comfortDelta: clamp((neighbor.comfort - currentTile.comfort) / 3.6, -1.2, 1.2),
-        frontier: occupancy.has(neighbor.id) ? 0 : 1,
-        ruggedness: terrainRuggedness(neighbor.terrain),
-        aridity: terrainAridity(neighbor.terrain),
+        resourceDelta: clamp((neighborFood - currentFood) / 260, -1.0, 1.0),
+        waterDelta: clamp((candidate.water - currentTile.water) / 5.2, -1.2, 1.2),
+        occupancyRelief: clamp((currentCrowding - neighborCrowding) / 1.45, -1.2, 1.2),
+        riskRelief: clamp((currentRisk - neighborRisk) / 1.25, -1.2, 1.2),
+        comfortDelta: clamp((candidate.comfort - currentTile.comfort) / 3.2, -1.2, 1.2),
+        frontier: occupancy.has(candidate.id) ? 0 : 1,
+        ruggedness: terrainRuggedness(candidate.terrain),
+        aridity: terrainAridity(candidate.terrain),
         alliedPresence: clamp(alliedPresence / 2, 0, 1.2),
         hostilePresence: clamp(hostilePresence / 3, 0, 1.2),
-        resourceCollapse: foodCapacityCollapse(neighbor),
+        resourceCollapse: foodCapacityCollapse(candidate),
         storedFood: clamp(tribe.foodStores, 0, 1.2),
         geneticRisk: clamp(1 - tribe.geneticDiversity, 0, 1.2),
         megafaunaDecline: clamp(1 - currentTile.megafaunaIndex, 0, 1.2),
         storytellerCrisis: storytellerPressure,
         defeatVulnerability,
       });
-      const policyBoost = decisionAdjustment(decisionPolicy, 'migrate', features, 0.18);
+      const policyBoost = decisionAdjustment(decisionPolicy, 'migrate', features, policyKind === 'relocation' ? 0.14 : 0.08);
+      // Frontier bonus scales with regional density push — crowded homeland = stronger frontier pull
+      const frontierBase = policyKind === 'relocation'
+        ? 0.28 + mobility * 0.18 + densityPush * 0.42
+        : 0.1 + mobility * 0.08 + densityPush * 0.22;
       let score =
-        features.resourceDelta * 1.28 +
-        features.waterDelta * 1.12 +
-        features.occupancyRelief * (1.58 + mobility * 0.84) +
-        features.riskRelief * 1.12 +
-        features.frontier * (0.42 + mobility * 0.62 + tribe.pressures.competition * 0.56) +
-        features.allySupport * 0.22 +
-        features.geneticRisk * 0.1 +
-        features.megafaunaDecline * (0.14 + mobility * 0.08) -
-        features.resourceCollapse * 0.28 -
-        features.storedFood * 0.12 -
-        features.hostility * 0.34 -
-        features.aridity * (0.14 + tribe.pressures.water * 0.28 + tribe.development.sedentism * 0.22) -
-        features.ruggedness * (0.04 + tribe.development.sedentism * 0.14) +
-        features.comfortDelta * 0.02;
+        features.resourceDelta * 1.08 +
+        features.waterDelta * 0.94 +
+        features.occupancyRelief * (0.9 + mobility * 0.4) +
+        features.riskRelief * 1.02 +
+        features.comfortDelta * 0.12 +
+        features.frontier * frontierBase +
+        features.allySupport * 0.2 +
+        corridorSupport * (policyKind === 'relocation' ? 0.38 + densityPush * 0.2 : 0.22 + densityPush * 0.12) +
+        densityRelief * (0.18 + densityPush * 0.24) +
+        (steps > 1 ? Math.min(steps / 6, 1) * 0.16 : 0) +
+        features.geneticRisk * 0.14 +
+        features.megafaunaDecline * (0.08 + mobility * 0.04) -
+        features.storedFood * 0.18 -
+        features.resourceCollapse * 0.24 -
+        features.hostility * 0.3 -
+        features.aridity * (candidate.movementTags.includes('desert-pass') ? 0.08 : 0.16 + tribe.pressures.water * 0.18) -
+        features.ruggedness * (candidate.movementTags.includes('mountain-pass') ? 0.08 : 0.16 + tribe.development.sedentism * 0.08) -
+        pathCost * (policyKind === 'relocation' ? 0.08 : 0.03);
 
-      if (neighbor.terrain === 'highland') {
-        score +=
-          (mobility > 0.64 ? 0.12 : 0.04) +
-          Math.max(0, features.occupancyRelief) * 0.08 +
-          Math.max(0, tribe.pressures.competition - 0.24) * 0.12;
+      if (candidate.terrain === 'mountain' && !candidate.movementTags.includes('mountain-pass')) {
+        score -= emergency ? 0.16 : 0.32;
       }
-      if (neighbor.terrain === 'mountain') {
-        score -= 0.06 + tribe.development.sedentism * 0.16;
+      if (
+        candidate.terrain === 'desert' &&
+        !candidate.movementTags.includes('desert-pass') &&
+        !candidate.movementTags.includes('coastal-corridor')
+      ) {
+        score -= emergency ? 0.08 : 0.18;
       }
 
-      const adjustedScore = score * policyBoost;
-      if (adjustedScore > bestScore) {
-        bestScore = adjustedScore;
-        bestTile = neighbor;
-        bestFeatures = features;
+      return {
+        tile: candidate,
+        features,
+        score: score * policyBoost,
+      };
+    };
+
+    let bestLocal: ReturnType<typeof evaluateCandidate> | null = null;
+    for (const neighborId of currentTile.neighbors) {
+      const neighbor = readTiles.get(neighborId);
+      if (!neighbor || neighbor.terrain === 'sea') {
+        continue;
+      }
+      const candidate = evaluateCandidate(neighbor, 1, tileTraversalCost(neighbor), 'local');
+      if (!bestLocal || candidate.score > bestLocal.score) {
+        bestLocal = candidate;
       }
     }
 
-    const migrationAdjustment = decisionAdjustment(decisionPolicy, 'migrate', bestFeatures, 0.18);
-    const migrationChance = clamp(
-      config.globals.G_migration *
-        (0.32 +
-          migrationPressure * 3.1 +
-          frontierDrive * 0.66 +
-          Math.max(bestScore, -0.18) * 0.46 +
-          currentRisk * 0.48 +
-          storytellerPressure * 0.16 +
-          defeatVulnerability * 0.22) *
-        leaderModifiers.migration *
-        migrationAdjustment /
-        (1 + stageProfile.migrationFriction * 0.92 + tribe.development.sedentism * 0.78),
-      0.03,
-      0.94,
-    );
-    const acceptanceThreshold =
-      -0.46 + frontierDrive * 0.22 + mobility * 0.1 - storytellerPressure * 0.08;
+    const strongRelocation =
+      emergency ||
+      tribe.leader?.archetype === 'Pathfinder' ||
+      tribe.pressures.competition > 0.52 ||
+      tribe.pop > TRIBE_SPLIT_THRESHOLD * 0.82;
+    const pathBudget = strongRelocation ? 10 : 6;
+    const pathMap = gatherTilePaths(currentTile.id, pathBudget);
+    let bestRelocation:
+      | (ReturnType<typeof evaluateCandidate> & { path: string[]; steps: number; pathCost: number })
+      | null = null;
 
-    if (bestTile.id !== currentTile.id && bestScore > acceptanceThreshold && prng.next() < migrationChance) {
-      const target = writeTribes.get(tribe.id)!;
-      target.tileId = bestTile.id;
-      target.statusFlags.migrating = true;
-      target.development.domestication = round(
-        clamp(
-          target.development.domestication -
-            target.development.sedentism * 4 +
-            bestFeatures.megafaunaDecline * 1.2 -
-            stageRank(target.development.agricultureStage) * 0.4,
-          0,
-          100,
-        ),
-        2,
+    for (const [tileId, node] of pathMap) {
+      if (tileId === currentTile.id || node.steps < 2 || node.steps > pathBudget) {
+        continue;
+      }
+      if (node.steps > 6 && !strongRelocation) {
+        continue;
+      }
+      const candidateTile = readTiles.get(tileId);
+      if (!candidateTile || candidateTile.terrain === 'sea') {
+        continue;
+      }
+      const path = recoverPath(currentTile.id, tileId, pathMap);
+      if (path.length !== node.steps + 1) {
+        continue;
+      }
+      const candidate = evaluateCandidate(candidateTile, node.steps, node.cost, 'relocation');
+      const withPath = { ...candidate, path, steps: node.steps, pathCost: node.cost };
+      if (!bestRelocation || withPath.score > bestRelocation.score) {
+        bestRelocation = withPath;
+      }
+    }
+
+    if (bestLocal) {
+      const localThreshold = 0.22 + tribe.development.sedentism * 0.12 - mobility * 0.05 - densityPush * 0.08;
+      const localChance = clamp(
+        config.globals.G_migration *
+          (0.08 +
+            migrationPressure * 0.18 +
+            currentRisk * 0.12 +
+            Math.max(bestLocal.score - localThreshold, 0) * 0.18) *
+          leaderModifiers.migration *
+          decisionAdjustment(decisionPolicy, 'migrate', bestLocal.features, 0.08) /
+          (1 + stageProfile.migrationFriction * 1.3 + tribe.development.sedentism * 1.25),
+        emergency ? 0.02 : 0.01,
+        emergency ? 0.32 : 0.14,
       );
-      target.development.sedentism = round(clamp(target.development.sedentism * 0.88, 0.02, 0.94), 3);
-      target.exchange.tradeVolume = round(clamp(target.exchange.tradeVolume * 0.82, 0, 1.5), 3);
-      target.foodStores = round(clamp(target.foodStores * 0.74, 0, 1), 3);
-      changedTribeIds.add(target.id);
-      events.push({
-        id: eventId('migration', write.year, events.length),
-        year: write.year,
-        kind: 'migration',
-        title: `${tribe.name} migrated`,
-        detail:
-          currentRisk > 0.45 || tribe.pressures.competition > 0.42
-            ? `${tribe.name} moved from ${currentTile.name} to ${bestTile.name} while escaping crowding, hazard, and disease pressure.`
-            : `${tribe.name} moved from ${currentTile.name} to ${bestTile.name}.`,
-        tribeId: tribe.id,
-        tileId: bestTile.id,
-      });
+
+      if (bestLocal.score > localThreshold && prng.next() < localChance) {
+        target.tileId = bestLocal.tile.id;
+        target.statusFlags.migrating = true;
+        clearMigrationPlan(target, false);
+        target.migration.homeTileId = bestLocal.tile.id;
+        target.migration.cooldownYears = Math.max(
+          target.migration.cooldownYears,
+          3 + Math.round(tribe.development.sedentism * 3) + Math.round(stageRank(tribe.development.agricultureStage) * 2),
+        );
+        applyMovementCosts(target, bestLocal.tile, false);
+        changedTribeIds.add(target.id);
+        events.push({
+          id: eventId('migration', write.year, events.length),
+          year: write.year,
+          kind: 'migration',
+          title: tribe.name + ' shifted range',
+          detail:
+            tribe.name +
+            ' shifted from ' +
+            currentTile.name +
+            ' to ' +
+            bestLocal.tile.name +
+            ' without fully abandoning its local range.',
+          tribeId: tribe.id,
+          tileId: bestLocal.tile.id,
+        });
+        continue;
+      }
     }
+
+    if (!bestRelocation) {
+      continue;
+    }
+
+    const relocationThreshold = 0.34 + tribe.development.sedentism * 0.14 - mobility * 0.08 - densityPush * 0.12;
+    const relocationChance = clamp(
+      config.globals.G_migration *
+        (0.04 +
+          migrationPressure * 0.14 +
+          frontierDrive * 0.12 +
+          densityPush * 0.06 +
+          Math.max(bestRelocation.score - relocationThreshold, 0) * 0.16 +
+          (strongRelocation ? 0.05 : 0)) *
+        leaderModifiers.migration *
+        decisionAdjustment(decisionPolicy, 'migrate', bestRelocation.features, 0.12) /
+        (1 + stageProfile.migrationFriction * 0.72 + tribe.development.sedentism * 0.6),
+      emergency ? 0.02 : 0.01,
+      emergency ? 0.3 : 0.14,
+    );
+
+    if (bestRelocation.score <= relocationThreshold || prng.next() >= relocationChance) {
+      continue;
+    }
+
+    const route = bestRelocation.path.slice(1);
+    const firstStepId = route[0];
+    const firstStep = firstStepId ? readTiles.get(firstStepId) : null;
+    if (!firstStep) {
+      continue;
+    }
+
+    target.tileId = firstStep.id;
+    target.statusFlags.migrating = true;
+    target.migration.destinationTileId = bestRelocation.tile.id;
+    target.migration.plannedRouteTileIds = route.slice(1);
+    target.migration.commitmentYears = route.length + 2;
+    applyMovementCosts(target, firstStep, true);
+    if (target.tileId === bestRelocation.tile.id || target.migration.plannedRouteTileIds.length === 0) {
+      clearMigrationPlan(target, true);
+    }
+    changedTribeIds.add(target.id);
+    events.push({
+      id: eventId('migration', write.year, events.length),
+      year: write.year,
+      kind: 'migration',
+      title: tribe.name + ' began a relocation',
+      detail:
+        tribe.name +
+        ' left ' +
+        currentTile.name +
+        ' for ' +
+        firstStep.name +
+        ', committing to a longer move toward ' +
+        bestRelocation.tile.name +
+        '.',
+      tribeId: tribe.id,
+      tileId: firstStep.id,
+    });
   }
 }
+
 
 function applyFissionPhase(
   read: WorldState,
@@ -2594,6 +3328,12 @@ function applyFissionPhase(
   const nextTribes = [...write.tribes];
   const tileMap = tilesById(write);
   const projectedOccupancy = occupancyByTile(write);
+  const tileToTribes = new Map<string, TribeState[]>();
+  for (const t of read.tribes) {
+    const list = tileToTribes.get(t.tileId);
+    if (list) list.push(t);
+    else tileToTribes.set(t.tileId, [t]);
+  }
 
   for (const source of read.tribes) {
     if (source.pop < TRIBE_SPLIT_THRESHOLD) {
@@ -2606,21 +3346,21 @@ function applyFissionPhase(
     }
 
     const splitPressure = clamp(
-      (source.pop - 150) / 260 +
-        source.pressures.competition * 0.5 +
-        source.pressures.organization * 0.3 +
-        source.exchange.warExhaustion * 0.2 +
-        source.exchange.raidExposure * 0.18 +
-        (1 - config.globals.G_cohesion) -
-        target.abilities.organization.current / 420 -
-        getLeaderModifiers(target.leader).cohesion * 0.12 +
-        target.alliances.length * 0.02 -
-        target.development.sedentism * 0.08,
+      (source.pop - TRIBE_SPLIT_THRESHOLD) / 480 +
+        Math.max(0, source.pressures.competition - 0.18) * 0.56 +
+        Math.max(0, source.pressures.organization - 0.22) * 0.18 +
+        source.exchange.warExhaustion * 0.12 +
+        source.exchange.raidExposure * 0.08 +
+        (1 - config.globals.G_cohesion) * 0.8 -
+        target.abilities.organization.current / 520 -
+        getLeaderModifiers(target.leader).cohesion * 0.16 +
+        target.alliances.length * 0.03 -
+        target.development.sedentism * 0.1,
       0,
-      0.85,
+      0.72,
     );
 
-    if (splitPressure < 0.18 || prng.next() >= splitPressure) {
+    if (splitPressure < 0.34 || prng.next() >= splitPressure) {
       continue;
     }
 
@@ -2635,8 +3375,21 @@ function applyFissionPhase(
 
     const childId = `${source.id}-branch-${write.year}-${events.length}`;
     target.pop = source.pop - childPop;
+    target.exchange.warExhaustion = round(clamp(target.exchange.warExhaustion + 0.12, 0, 1.5), 3);
+    target.exchange.tradeVolume = round(clamp(target.exchange.tradeVolume * 0.82, 0, 1.5), 3);
+    target.abilities.organization.current = round(clamp(target.abilities.organization.current - 4, 0, target.abilities.organization.cap), 2);
     setRelationship(writeTribes, target.id, childId, TRIBE_RELATION_BOUND * 0.4);
     changedTribeIds.add(target.id);
+
+    // Child inherits techs from parent, but may lose 1-2 advanced ones
+    let childTechs = [...target.knownTechnologies];
+    const techsToMaybeLose = childTechs.filter((t) => TECH_TREE[t]?.populationRequirement > childPop * 0.8);
+    for (const t of techsToMaybeLose) {
+      if (prng.next() < 0.3) {
+        const deps = childTechs.filter((tid) => TECH_TREE[tid]?.prerequisites.includes(t));
+        if (deps.length === 0) childTechs = childTechs.filter((x) => x !== t);
+      }
+    }
 
     const child: TribeState = {
       ...structuredClone(target),
@@ -2644,6 +3397,7 @@ function applyFissionPhase(
       name: deriveBranchName(source),
       pop: childPop,
       leader: createSuccessorLeader(target, prng),
+      knownTechnologies: childTechs,
       relationships: {
         [source.id]: round(TRIBE_RELATION_BOUND * 0.4, 2),
       },
@@ -2654,10 +3408,10 @@ function applyFissionPhase(
         sedentism: round(clamp(target.development.sedentism * 0.86, 0.02, 0.94), 3),
       },
       exchange: {
-        tradeVolume: round(clamp(target.exchange.tradeVolume * 0.6, 0, 1.5), 3),
-        diffusion: round(clamp(target.exchange.diffusion * 0.8, 0, 1.5), 3),
+        tradeVolume: round(clamp(target.exchange.tradeVolume * 0.45, 0, 1.5), 3),
+        diffusion: round(clamp(target.exchange.diffusion * 0.7, 0, 1.5), 3),
         raidExposure: 0,
-        warExhaustion: round(clamp(target.exchange.warExhaustion * 0.6, 0, 1.5), 3),
+        warExhaustion: round(clamp(target.exchange.warExhaustion * 0.72 + 0.08, 0, 1.5), 3),
       },
       geneticDiversity: round(clamp(target.geneticDiversity * 0.98, 0, 1), 4),
       foodStores: round(clamp(target.foodStores * 0.5, 0, 1), 3),
@@ -2670,34 +3424,80 @@ function applyFissionPhase(
 
     const originTile = tileMap.get(source.tileId);
     let settlementDetail = `The new branch remained near ${source.tileId}.`;
-    if (originTile) {
-      const originFood = getFoodCapacity(originTile);
+    if (source.migration.destinationTileId && source.migration.plannedRouteTileIds.length) {
+      child.migration.homeTileId = source.tileId;
+      child.migration.destinationTileId = source.migration.destinationTileId;
+      child.migration.plannedRouteTileIds = [...source.migration.plannedRouteTileIds];
+      child.migration.commitmentYears = Math.max(2, source.migration.commitmentYears);
+      child.statusFlags.migrating = true;
+      target.migration.destinationTileId = null;
+      target.migration.plannedRouteTileIds = [];
+      target.migration.commitmentYears = 0;
+      target.migration.homeTileId = target.tileId;
+      target.migration.cooldownYears = Math.max(target.migration.cooldownYears, 4);
+      target.statusFlags.migrating = false;
+      settlementDetail = child.name + ' split away from ' + source.name + ' and continued the migration route toward ' + (tileMap.get(source.migration.destinationTileId)?.name ?? source.migration.destinationTileId) + '.';
+    }
+    if (originTile && !child.migration.destinationTileId) {
+      const coastalForagingChild = child.development.agricultureStage === 'foraging' || child.development.agricultureStage === 'tending';
+      const originFood = getFoodCapacity(originTile, coastalForagingChild);
       const originCrowding = (projectedOccupancy.get(originTile.id) ?? source.pop) / Math.max(originFood, 1);
       const mobility = mobilityProfile(child);
       let bestDestination = originTile;
       let bestDestinationScore = -Infinity;
 
-      for (const neighborId of originTile.neighbors) {
+      // Gather candidate tiles: 1-hop always; 2-hop when crowded; 3-hop when very crowded
+      const localTribes = tileToTribes.get(originTile.id)?.length ?? 0;
+      const searchHops = localTribes >= 6 ? 3 : localTribes >= 3 ? 2 : 1;
+      const candidateSet = new Set<string>();
+      // 1-hop
+      for (const n1 of originTile.neighbors) candidateSet.add(n1);
+      // 2-hop
+      if (searchHops >= 2) {
+        for (const n1 of originTile.neighbors) {
+          const t1 = tileMap.get(n1);
+          if (t1) for (const n2 of t1.neighbors) {
+            if (n2 !== originTile.id) candidateSet.add(n2);
+          }
+        }
+      }
+      // 3-hop
+      if (searchHops >= 3) {
+        const hop2 = new Set(candidateSet);
+        for (const n2id of hop2) {
+          const t2 = tileMap.get(n2id);
+          if (t2) for (const n3 of t2.neighbors) {
+            if (n3 !== originTile.id) candidateSet.add(n3);
+          }
+        }
+      }
+
+      for (const neighborId of candidateSet) {
         const neighbor = tileMap.get(neighborId);
-        if (!neighbor) {
+        if (!neighbor || neighbor.terrain === 'sea') {
           continue;
         }
 
-        const neighborFood = getFoodCapacity(neighbor);
+        const neighborFood = getFoodCapacity(neighbor, coastalForagingChild);
         const neighborCrowding = (projectedOccupancy.get(neighbor.id) ?? 0) / Math.max(neighborFood, 1);
+        const hops = originTile.neighbors.includes(neighborId) ? 1 : searchHops >= 3 ? 3 : 2;
+        const distancePenalty = hops > 1 ? (hops - 1) * 0.12 : 0;
+        const corridorBonus = corridorAffinity(neighbor) * 0.18;
         let destinationScore =
           clamp((originCrowding - neighborCrowding) / 1.15, -1.2, 1.2) * (1.28 + source.pressures.competition * 1.02) +
-          clamp((neighborFood - originFood) / 210, -1.2, 1.2) * 0.68 +
+          clamp((neighborFood - originFood) / 260, -1.0, 1.0) * 0.68 +
           clamp((neighbor.water - originTile.water) / 4.5, -1.2, 1.2) * 0.44 +
-          (projectedOccupancy.has(neighbor.id) ? 0 : 0.42 + source.pressures.competition * 0.28) -
+          (projectedOccupancy.has(neighbor.id) ? 0 : 0.52 + source.pressures.competition * 0.36) +
+          corridorBonus -
+          distancePenalty -
           terrainAridity(neighbor.terrain) * (0.12 + source.pressures.water * 0.22) -
           terrainRuggedness(neighbor.terrain) * (0.03 + child.development.sedentism * 0.12) -
           foodCapacityCollapse(neighbor) * 0.2;
 
         if (neighbor.terrain === 'highland') {
           destinationScore +=
-            (mobility > 0.68 ? 0.22 : 0.08) +
-            Math.max(0, source.pressures.competition - 0.18) * 0.46;
+            (mobility > 0.68 ? 0.32 : 0.12) +
+            Math.max(0, source.pressures.competition - 0.12) * 0.68;
         }
         if (neighbor.terrain === 'mountain') {
           destinationScore -= 0.08 + child.development.sedentism * 0.18;
@@ -2846,13 +3646,13 @@ function updateStoryteller(state: WorldState, events: SimulationEvent[]): void {
     st.crisisStreak = Math.max(0, st.crisisStreak - 1);
   }
 
-  const significantEvents = events.filter((event) =>
+  const hasSignificantEvent = events.some((event) =>
     event.kind === 'disaster' ||
     event.kind === 'disease' ||
     event.kind === 'combat' ||
     event.kind === 'migration',
   );
-  if (significantEvents.length === 0) {
+  if (!hasSignificantEvent) {
     st.quietStreak += 1;
   } else {
     st.quietStreak = 0;
@@ -2888,7 +3688,7 @@ function finalizeState(
   state: WorldState,
   previousMetrics: WorldMetrics,
   events: SimulationEvent[],
-): WorldState {
+): void {
   state.metrics = computeMetrics(state, previousMetrics, events);
   state.history.push({
     year: state.year,
@@ -2897,9 +3697,20 @@ function finalizeState(
     innovations: state.metrics.innovations,
     conflicts: state.metrics.conflicts,
   });
-  state.history = state.history.slice(-72);
-  state.eventLog = [...events.reverse(), ...state.eventLog].slice(0, 48);
-  return state;
+  // Keep history bounded without allocating a new array when under limit
+  if (state.history.length > 72) {
+    state.history = state.history.slice(-72);
+  }
+  // Prepend new events and cap total length without spread allocation
+  events.reverse();
+  const maxLog = 48;
+  const keep = Math.min(state.eventLog.length, maxLog - Math.min(events.length, maxLog));
+  if (keep <= 0) {
+    state.eventLog = events.slice(0, maxLog);
+  } else {
+    state.eventLog = events.concat(state.eventLog.slice(0, keep));
+    if (state.eventLog.length > maxLog) state.eventLog.length = maxLog;
+  }
 }
 
 export function createSimulationEngine(initialConfig: SimulationConfig, options: SimulationEngineOptions = {}): SimulationEngine {
@@ -2916,21 +3727,35 @@ export function createSimulationEngine(initialConfig: SimulationConfig, options:
     const changedTileIds = new Set<string>();
     const changedTribeIds = new Set<string>();
 
-    let current = cloneState(state);
-    let staging = cloneState(state);
+    // Optimized: only 1 clone for the read snapshot; mutate write in-place.
+    // Between phases, swap read = write and create a fresh write by cloning
+    // only the arrays that the next phase mutates (tiles or tribes), not the
+    // entire world state.
+    const read = cloneState(state);
+    const write = cloneState(state);
 
-    applyGlobalPhase(current, staging, config, emittedEvents);
-    current = staging;
+    applyGlobalPhase(read, write, config, emittedEvents);
+    // Global phase only touches scalars on write. Copy them into read for
+    // tile phase to see the new climate. No deep clone needed.
+    read.year = write.year;
+    read.globalClimate = { ...write.globalClimate };
+    read.activeClimatePulses = write.activeClimatePulses;
+    read.pendingInterventions = write.pendingInterventions;
+    read.executedInterventions = write.executedInterventions;
+    read.storyteller = { ...write.storyteller };
 
-    staging = cloneState(current);
-    applyTilePhase(current, staging, config, prng, emittedEvents, changedTileIds);
-    current = staging;
+    applyTilePhase(read, write, config, prng, emittedEvents, changedTileIds);
+    // Tile phase mutated write.tiles. Swap tiles into read so tribe phase
+    // sees updated tiles but old tribes.
+    read.tiles = write.tiles;
+    // Clone write.tribes from read.tribes so tribe phase has a fresh write target
+    // (the read.tribes are still the pre-tick snapshot).
+    write.tribes = structuredClone(read.tribes);
 
-    staging = cloneState(current);
     if (config.enabledSystems.tribeDynamics) {
       applyTribePhase(
-        current,
-        staging,
+        read,
+        write,
         config,
         prng,
         emittedEvents,
@@ -2940,33 +3765,33 @@ export function createSimulationEngine(initialConfig: SimulationConfig, options:
         decisionPolicy,
       );
     }
-    current = staging;
+    // Tribe phase mutated write.tribes. Swap into read for interaction phase.
+    read.tribes = write.tribes;
+    write.tribes = structuredClone(read.tribes);
 
-    staging = cloneState(current);
-    applyInteractionPhase(current, staging, config, prng, emittedEvents, changedTribeIds, decisionPolicy);
-    current = staging;
+    applyInteractionPhase(read, write, config, prng, emittedEvents, changedTribeIds, decisionPolicy);
+    read.tribes = write.tribes;
+    write.tribes = structuredClone(read.tribes);
 
-    staging = cloneState(current);
-    applyMigrationPhase(current, staging, config, prng, emittedEvents, changedTribeIds, decisionPolicy);
-    current = staging;
+    applyMigrationPhase(read, write, config, prng, emittedEvents, changedTribeIds, decisionPolicy);
+    read.tribes = write.tribes;
+    write.tribes = structuredClone(read.tribes);
 
-    staging = cloneState(current);
     applyFissionPhase(
-      current,
-      staging,
+      read,
+      write,
       config,
       prng,
       emittedEvents,
       changedTribeIds,
       populationCarry,
     );
-    current = staging;
 
-    applyExtinctionPhase(current, emittedEvents, changedTribeIds, populationCarry);
-    updateStoryteller(current, emittedEvents);
+    applyExtinctionPhase(write, emittedEvents, changedTribeIds, populationCarry);
+    updateStoryteller(write, emittedEvents);
 
-    current = finalizeState(current, previousMetrics, emittedEvents);
-    state = current;
+    finalizeState(write, previousMetrics, emittedEvents);
+    state = write;
 
     return {
       previousYear,
@@ -2980,37 +3805,37 @@ export function createSimulationEngine(initialConfig: SimulationConfig, options:
         innovations: state.metrics.innovations - previousMetrics.innovations,
         conflicts: state.metrics.conflicts - previousMetrics.conflicts,
       },
-      phases: [...PHASES],
-      state: cloneState(state),
+      phases: PHASES,
+      state,
     };
   }
 
   return {
     getState() {
-      return cloneState(state);
+      return state;
     },
     getConfig() {
-      return cloneSimulationConfig(config);
+      return config;
     },
     step(years = 1) {
       const stepYears = normalizeStepYears(years);
-      let result = stepOnce();
-      for (let index = 1; index < stepYears; index += 1) {
+      let result: SimulationStepResult;
+      for (let index = 0; index < stepYears; index += 1) {
         result = stepOnce();
       }
-      return result;
+      return result!;
     },
     enqueueIntervention(command) {
       state.pendingInterventions.push(command);
       state.pendingInterventions.sort((left, right) => left.scheduledYear - right.scheduledYear);
-      return this.getState();
+      return state;
     },
     reset(nextConfig = config) {
       config = cloneSimulationConfig(nextConfig);
       state = createInitialWorldState(config);
       prng = createPrng(config.seed);
       populationCarry = new Map(state.tribes.map((tribe) => [tribe.id, 0]));
-      return this.getState();
+      return state;
     },
     setRuntimeSpeed(yearsPerSecond) {
       config.runtime.yearsPerSecond = clamp(yearsPerSecond, 1, 240);

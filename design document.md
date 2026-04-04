@@ -186,8 +186,16 @@ Each tile tracks a `megafaunaIndex` (0.0 to 1.0):
 
 ```
 megafauna_bonus = 1 + megafaunaIndex * 0.5
-effective_hunt_capacity = hunt_capacity * megafauna_bonus
+coastal_foraging_bonus = 45  (if foraging/tending stage AND coast or coastal-corridor tile)
+effective_food_capacity = hunt_capacity * megafauna_bonus + agri_capacity + coastal_foraging_bonus
 ```
+
+### Coastal foraging (Beachcomber hypothesis)
+
+Coast and coastal-corridor tiles receive +45 effective food capacity for tribes at the foraging or tending agriculture stage. This reflects the archaeological evidence for early human exploitation of shellfish, intertidal resources, and littoral plant foods along coastlines. The bonus:
+- Makes coastal exit routes from Africa viable for early foraging bands (Red Sea coast, Horn of Africa)
+- Creates a "beachcomber highway" along the Indian Ocean coast, matching the Southern Dispersal Route hypothesis
+- Naturally fades as tribes advance to cultivation and farming stages (who rely more on agri capacity)
 
 Megafauna decline is driven by a combination of human hunting pressure and climate stress (the overkill-climate synergy that the academic literature supports):
 
@@ -690,55 +698,94 @@ Combat is intentionally coarse-grained. It exists to alter migration, collapse, 
 
 ## 12. Migration
 
-Migration is the main spatial mechanic. A tribe evaluates all neighboring tiles and may move to the best alternative.
+Migration is the main spatial mechanic. A tribe evaluates neighboring tiles (local moves) and multi-hop destinations (relocations) and may move to the best alternative. The system is tuned to reproduce the historical Out-of-Africa expansion: population pressure in the East African cradle gradually pushes tribes through exit corridors (Nile, Red Sea coast) into Eurasia over thousands of years.
+
+### Regional density push
+
+Before individual tribe decisions, the engine computes a **regional density** for every tile: the number of tribes within 2 hex hops. This creates a "population pressure gradient" that makes crowded regions push tribes outward even when local tile resources are adequate. The density push factor is:
+
+```
+density_push = clamp((regional_tribes - 4) / 12, 0, 1.0)
+```
+
+This kicks in when more than 4 tribes occupy the neighborhood and scales linearly up to ~16 tribes. It amplifies frontier drive, lowers migration thresholds, and boosts the attractiveness of less-crowded destinations.
 
 ### Migration trigger
 
 A tribe considers migrating when any of:
-- Total pressure > 0.2
-- Food pressure * 1.22 > threshold
-- Water pressure * 1.14 > threshold
+- Total pressure > 0.14
+- Food pressure * 1.24 > threshold
+- Water pressure * 1.15 > threshold
 - Health pressure * 1.05 > threshold
-- Competition * 1.18 > threshold
-- Current risk (disasters + plagues + raids + war) > 0.3
-- Frontier drive > 0.34
+- Competition * 1.22 > threshold
+- Current risk (disasters + plagues + raids + war) > 0.46
+- Frontier drive > 0.16
+
+Frontier drive now incorporates density push:
+
+```
+frontier_drive = clamp(
+    competition * 0.92 + food_pressure * 0.54
+  + mobility * 0.18 + storyteller_pressure * 0.1
+  + density_push * 0.6,
+  0, 1.6)
+```
 
 ### Tile scoring
 
-Each neighbor is scored on:
+Each candidate tile is scored on:
 
 ```
-score = resource_delta * 1.3
-      + water_delta * 0.95
-      + occupancy_relief * (1.14 + mobility * 0.52)
-      + risk_relief * 1.06
-      + frontier_bonus * (0.22 + mobility * 0.48 + competition * 0.32)
-      + ruggedness * mobility * 0.5
-      + comfort_delta * 0.1
-      + allied_presence * 0.2
-      - hostile_presence * 0.28
+score = resource_delta * 1.08
+      + water_delta * 0.94
+      + occupancy_relief * (0.9 + mobility * 0.4)
+      + risk_relief * 1.02
+      + comfort_delta * 0.12
+      + frontier_bonus * (base + density_push * scale)
+      + corridor_support * (0.38 + density_push * 0.2)  [relocation]
+      + density_relief * (0.18 + density_push * 0.24)
+      + genetic_risk * 0.14
+      + megafauna_decline * (0.08 + mobility * 0.04)
+      - stored_food * 0.18
+      - resource_collapse * 0.24
+      - hostility * 0.3
       - aridity_penalty
+      - ruggedness_penalty
+      - path_cost * 0.08  [relocation]
 ```
 
-**Frontier bonus**: unoccupied tiles receive a bonus that scales with mobility and competition pressure. This drives the wave-front expansion pattern: when competition rises in a settled area, mobile tribes push into empty territory. Highly sedentary tribes rarely receive enough frontier bonus to overcome their migration friction.
+Key differences from early versions:
+- **Resource delta** uses a wider divisor (260 vs 190), compressing the penalty for moving from rich African tiles to poorer exit corridors. This prevents the "Africa trap" where the huge food gap (hunt 235 → 110) created an insurmountable negative score.
+- **Frontier bonus** scales with `density_push`: in crowded regions, the pull of empty tiles is much stronger.
+- **Corridor support** is boosted for relocations (0.38 base vs old 0.3) and further amplified by density push. Tiles tagged as river-corridor, coastal-corridor, steppe-corridor, land-bridge, desert-pass, or mountain-pass receive substantial attraction bonuses.
+- **Density relief** is a new term: moving from a high-density region to a low-density region is scored positively. This creates a pressure gradient that pushes the expansion wavefront outward.
+- **Coastal foraging bonus**: coast and coastal-corridor tiles receive +45 effective food capacity for foraging/tending-stage tribes, reflecting the beachcomber hypothesis (shellfish, littoral resources). This makes coastal exit routes from Africa more viable for early humans.
+
+**Frontier bonus base values**:
+- Local moves: `0.1 + mobility * 0.08 + density_push * 0.22`
+- Relocations: `0.28 + mobility * 0.18 + density_push * 0.42`
 
 ### Migration friction
 
 ```
 migration_chance = G_migration
-    * pressure_drive * leader_migration_mod * policy_adj
-    / (1 + stage_friction + sedentism * 0.68)
+    * (base + pressure * 0.14 + frontier_drive * 0.12 + density_push * 0.06)
+    * leader_migration_mod * policy_adj
+    / (1 + stage_friction * 0.72 + sedentism * 0.6)
 ```
+
+The relocation threshold is also reduced by density push: `threshold = 0.34 + sedentism * 0.14 - mobility * 0.08 - density_push * 0.12`. This means tribes in crowded regions are more willing to commit to long-distance relocations.
 
 Higher agriculture stages and higher sedentism dramatically reduce migration probability. A settled-farming tribe with 0.7 sedentism faces a denominator of ~1.84 vs a foraging tribe's ~1.08 -- making them roughly half as likely to move under the same pressure. This creates the historical tension: settled groups can exploit land better but are trapped when conditions deteriorate.
 
 ### Migration cost
 
 When a tribe migrates:
-- Domestication drops by `sedentism * 4 + stage_rank * 0.4` (losing agricultural infrastructure)
-- Sedentism drops to 88% of current
-- Trade volume drops to 82% (disrupted networks)
-- Food stores drop by 30% (transport losses)
+- Domestication drops by `sedentism * domestication_loss + stage_rank * 0.24` (far) or `* 0.08` (local)
+- Sedentism drops to 92% (far) or 96.5% (local)
+- Trade volume drops to 80-88% (disrupted networks)
+- Food stores drop by 28% (far) or 16% (local)
+- Corridor support partially offsets domestication and food losses
 
 These costs mean migration is genuinely expensive for advanced tribes. A settled-farming tribe that is forced to migrate may drop back to agropastoral or even cultivation stage, losing generations of development. This is historically accurate: migration events in the Neolithic often involved significant cultural regression.
 
@@ -766,6 +813,23 @@ split_pressure =
 
 The `(pop - 150) / 260` term is the primary driver: 150 is Dunbar's number, the maximum group size maintainable through personal relationships. Above 150, formal organizational structures (organization ability, leader authority) are needed to maintain cohesion. A tribe of 300 with low organization ability splits almost certainly; a tribe of 300 with high organization and a Steward leader can hold together.
 
+### Settlement search radius
+
+Child tribes search for a settlement tile with a radius that scales with local crowding:
+- **1 hop** (default): when fewer than 3 tribes share the parent tile
+- **2 hops**: when 3-5 tribes share the parent tile
+- **3 hops**: when 6+ tribes share the parent tile
+
+This prevents the "clumping" problem where fission children pile up on the same tile as their parents in crowded regions. Combined with the corridor bonus in settlement scoring, child tribes in crowded East Africa are more likely to settle on corridor tiles leading out of the continent.
+
+Settlement scoring for child tribes includes:
+- Crowding relief (weighted by competition pressure)
+- Resource delta (compressed to avoid Africa trap, divisor 260)
+- Frontier bonus: `0.52 + competition * 0.36` for unoccupied tiles (stronger than migration frontier bonus)
+- Corridor bonus: `corridor_affinity * 0.18` attracts children to movement corridors
+- Distance penalty: `(hops - 1) * 0.12` for multi-hop settlements
+- Terrain penalties: aridity, ruggedness, mountain/highland modifiers
+
 ### Branch inheritance
 
 Child tribes inherit most of the parent profile with small drift:
@@ -773,7 +837,7 @@ Child tribes inherit most of the parent profile with small drift:
 - Abilities: parent values +/- 2 random drift per ability
 - Domestication: parent - 4
 - Sedentism: parent * 0.86
-- Trade volume: parent * 0.6
+- Trade volume: parent * 0.45
 - Relationships: starts fresh except moderate positive relation with parent
 - Leader: new leader via weighted lottery
 
@@ -907,14 +971,15 @@ These systems do not replace migration. They reshape when migration happens, who
 
 The simulation should produce recognizable macro-patterns without scripting:
 
-- **Coastal migration corridors** from high coastal carrying capacity
+- **Out-of-Africa expansion** from regional density push + coastal foraging bonus + corridor attraction. Population pressure in the East African cradle builds over centuries, eventually pushing tribes through the Nile corridor and Red Sea coast into the Levant and beyond. The density-relief gradient creates a wavefront that spreads naturally rather than requiring scripted events.
+- **Coastal migration corridors** from high coastal carrying capacity + coastal foraging bonus for early foragers (beachcomber hypothesis)
 - **River-valley agricultural cores** from high agri suitability + water + sedentism
 - **Steppe raiding frontiers** from high mobility + low agriculture + raid incentives
 - **Island isolation decline** from genetic diversity loss without trade contact
 - **Post-megafauna dietary revolution** from hunt capacity collapse forcing broadened subsistence
 - **Climate-driven expansion and contraction** from D-O oscillations and glacial cycles
 - **Trade-network cultural zones** from diffusion creating shared ability profiles among neighbors
-- **Fission-driven cultural diversification** from drift accumulating across branch lineages
+- **Fission-driven cultural diversification** from drift accumulating across branch lineages + multi-hop settlement search in crowded regions
 
 That is the identity of the simulator.
 

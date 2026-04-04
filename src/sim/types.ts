@@ -8,7 +8,16 @@ export type TerrainType =
   | 'plains'
   | 'steppe'
   | 'highland'
-  | 'mountain';
+  | 'mountain'
+  | 'sea';
+export type MovementTag =
+  | 'river-corridor'
+  | 'coastal-corridor'
+  | 'steppe-corridor'
+  | 'desert-pass'
+  | 'mountain-pass'
+  | 'land-bridge'
+  | 'strait';
 export type KoppenClimate =
   | 'Af'
   | 'Aw'
@@ -32,6 +41,51 @@ export type AbilityKey =
   | 'waterEngineering'
   | 'attack'
   | 'organization';
+export type TechnologyCategory = 'subsistence' | 'social' | 'military' | 'craft' | 'knowledge';
+export type TechnologyId =
+  | 'fire-mastery'
+  | 'cooking'
+  | 'hafted-tools'
+  | 'composite-tools'
+  | 'proto-cultivation'
+  | 'irrigation'
+  | 'animal-tracking'
+  | 'pack-hunting'
+  | 'early-domestication'
+  | 'herding'
+  | 'pottery'
+  | 'weaving'
+  | 'permanent-shelter'
+  | 'fortification'
+  | 'oral-tradition'
+  | 'counting'
+  | 'ritual-organization'
+  | 'basic-medicine'
+  | 'water-finding'
+  | 'well-digging'
+  | 'canal-building'
+  | 'stone-working'
+  | 'copper-working'
+  | 'bronze-working'
+  | 'boat-building'
+  | 'navigation'
+  | 'fermentation'
+  | 'granary-storage'
+  | 'tanning'
+  | 'smelting';
+
+export interface TechnologyDefinition {
+  id: TechnologyId;
+  name: string;
+  category: TechnologyCategory;
+  prerequisites: TechnologyId[];
+  effects: Partial<Record<AbilityKey, number>>;
+  populationRequirement: number;
+  regressionChance: number;
+  spreadWeight: number;
+  discoveryWeight: number;
+}
+
 export type InterventionKind = 'climate-pulse' | 'observation-note';
 export type LeaderArchetype = 'Pathfinder' | 'Steward' | 'Broker' | 'Sage';
 export type ClimateRegime =
@@ -163,6 +217,15 @@ export interface TileState {
   elevation: number;
   megafaunaIndex: number;
   coastal: boolean;
+  movementTags: MovementTag[];
+}
+
+export interface TribeMigrationState {
+  homeTileId: string;
+  cooldownYears: number;
+  destinationTileId: string | null;
+  plannedRouteTileIds: string[];
+  commitmentYears: number;
 }
 
 export interface TribeState {
@@ -181,6 +244,8 @@ export interface TribeState {
   foodStores: number;
   relationships: Record<string, number>;
   alliances: string[];
+  knownTechnologies: TechnologyId[];
+  migration: TribeMigrationState;
   statusFlags: {
     migrating: boolean;
     recovering: boolean;
@@ -329,6 +394,7 @@ export interface WorldPresentation {
   name: string;
   description: string;
   routeLanes: RouteLane[];
+  riverLanes?: RouteLane[];
   regionLabels: RegionLabel[];
   startTileId: string;
   startTileName: string;

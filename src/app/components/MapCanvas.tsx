@@ -40,6 +40,9 @@ interface MapPalette {
   pressureHigh: string;
   pressureMedium: string;
   route: string;
+  riverGlow: string;
+  riverMain: string;
+  riverHighlight: string;
   selection: string;
   hover: string;
   markerOutline: string;
@@ -78,6 +81,9 @@ function getPalette(themeMode: ThemeMode): MapPalette {
       pressureHigh: '#bf6545',
       pressureMedium: '#997647',
       route: '#6f8398',
+      riverGlow: 'rgba(121, 171, 214, 0.24)',
+      riverMain: '#4b88b6',
+      riverHighlight: 'rgba(233, 245, 255, 0.5)',
       selection: '#16212d',
       hover: '#5d7387',
       markerOutline: '#ffffff',
@@ -105,6 +111,9 @@ function getPalette(themeMode: ThemeMode): MapPalette {
     pressureHigh: '#bf5f3c',
     pressureMedium: '#8d6a3a',
     route: '#5c6f82',
+    riverGlow: 'rgba(58, 110, 153, 0.3)',
+    riverMain: '#5f96c2',
+    riverHighlight: 'rgba(221, 237, 248, 0.36)',
     selection: '#f2f5f8',
     hover: '#8ba1b7',
     markerOutline: '#0f141a',
@@ -137,6 +146,10 @@ function findTileAtPoint(x: number, y: number, hitAreas: TileHitArea[]) {
 }
 
 function getLayerColor(tile: WorldState['tiles'][number], layerMode: LayerMode, themeMode: ThemeMode) {
+  // Sea tiles are always rendered as water blue
+  if (tile.terrain === 'sea') {
+    return themeMode === 'light' ? 'rgb(120 165 200)' : 'rgb(35 65 95)';
+  }
   if (layerMode === 'habitability') {
     return themeMode === 'light'
       ? blendColor([197, 205, 214], [129, 171, 126], tile.habitability / 5.2)
@@ -158,6 +171,9 @@ function getLayerColor(tile: WorldState['tiles'][number], layerMode: LayerMode, 
 }
 
 function terrainStroke(tile: WorldState['tiles'][number], themeMode: ThemeMode) {
+  if (tile.terrain === 'sea') {
+    return themeMode === 'light' ? '#4a7da8' : '#2d5a7f';
+  }
   if (tile.terrain === 'desert') {
     return themeMode === 'light' ? '#9f8660' : '#8e7755';
   }
@@ -194,6 +210,207 @@ function drawLabel(
     context.font = '11px "Aptos", "Segoe UI Variable Text", sans-serif';
     context.fillText(placement.detail, placement.x + 8, placement.y + 19);
   }
+}
+
+function materializeLanePoints(
+  tileIds: string[],
+  centers: Map<string, { x: number; y: number }>,
+) {
+  const points: Array<{ x: number; y: number }> = [];
+  let previousTileId: string | null = null;
+
+  for (const tileId of tileIds) {
+    if (!tileId || tileId === previousTileId) {
+      continue;
+    }
+    const center = centers.get(tileId);
+    if (center) {
+      points.push(center);
+    }
+    previousTileId = tileId;
+  }
+
+  return points;
+}
+
+function axialDistance(left: { q: number; r: number }, right: { q: number; r: number }) {
+  const dq = left.q - right.q;
+  const dr = left.r - right.r;
+  const ds = dq + dr;
+  return (Math.abs(dq) + Math.abs(dr) + Math.abs(ds)) / 2;
+}
+
+function riverTravelCost(tile: WorldState['tiles'][number]) {
+  let cost = 1;
+
+  if (tile.terrain === 'river_valley') {
+    cost = 0.18;
+  } else if (tile.terrain === 'coast') {
+    cost = 0.46;
+  } else if (tile.water >= 5) {
+    cost = 0.52;
+  } else if (tile.water >= 4) {
+    cost = 0.72;
+  } else if (tile.terrain === 'plains' || tile.terrain === 'forest') {
+    cost = 0.96;
+  } else if (tile.terrain === 'savanna' || tile.terrain === 'steppe') {
+    cost = 1.08;
+  } else if (tile.terrain === 'highland') {
+    cost = 1.6;
+  } else if (tile.terrain === 'desert') {
+    cost = 2.2;
+  } else if (tile.terrain === 'mountain') {
+    cost = 3.4;
+  }
+
+  if (tile.isVolcanic || tile.isTectonic) {
+    cost += 0.08;
+  }
+
+  return cost;
+}
+
+function findWeightedTilePath(
+  startId: string,
+  endId: string,
+  tileMap: Map<string, WorldState['tiles'][number]>,
+) {
+  if (startId === endId) {
+    return [startId];
+  }
+
+  const start = tileMap.get(startId);
+  const goal = tileMap.get(endId);
+  if (!start || !goal) {
+    return [startId, endId].filter(Boolean);
+  }
+
+  const frontier: Array<{ tileId: string; priority: number }> = [{ tileId: startId, priority: 0 }];
+  const cameFrom = new Map<string, string | null>([[startId, null]]);
+  const costs = new Map<string, number>([[startId, 0]]);
+
+  while (frontier.length) {
+    frontier.sort((left, right) => left.priority - right.priority);
+    const currentId = frontier.shift()!.tileId;
+    if (currentId === endId) {
+      break;
+    }
+
+    const current = tileMap.get(currentId);
+    if (!current) {
+      continue;
+    }
+
+    for (const neighborId of current.neighbors) {
+      const neighbor = tileMap.get(neighborId);
+      if (!neighbor) {
+        continue;
+      }
+
+      const nextCost = (costs.get(currentId) ?? 0) + riverTravelCost(neighbor);
+      if (nextCost >= (costs.get(neighborId) ?? Number.POSITIVE_INFINITY)) {
+        continue;
+      }
+
+      costs.set(neighborId, nextCost);
+      cameFrom.set(neighborId, currentId);
+      frontier.push({
+        tileId: neighborId,
+        priority: nextCost + axialDistance(neighbor, goal) * 0.28,
+      });
+    }
+  }
+
+  if (!cameFrom.has(endId)) {
+    return [startId, endId];
+  }
+
+  const path: string[] = [];
+  let cursor: string | null = endId;
+  while (cursor) {
+    path.push(cursor);
+    cursor = cameFrom.get(cursor) ?? null;
+  }
+
+  return path.reverse();
+}
+
+function densifyPolyline(points: Array<{ x: number; y: number }>) {
+  if (points.length < 2) {
+    return points;
+  }
+
+  const dense: Array<{ x: number; y: number }> = [points[0]];
+  for (let index = 0; index < points.length - 1; index += 1) {
+    const current = points[index];
+    const next = points[index + 1];
+    dense.push(
+      { x: current.x + (next.x - current.x) / 3, y: current.y + (next.y - current.y) / 3 },
+      { x: (current.x + next.x) / 2, y: (current.y + next.y) / 2 },
+      { x: current.x + ((next.x - current.x) * 2) / 3, y: current.y + ((next.y - current.y) * 2) / 3 },
+      next,
+    );
+  }
+
+  return dense;
+}
+
+function materializeRiverLanePoints(
+  tileIds: string[],
+  tiles: WorldState['tiles'],
+  centers: Map<string, { x: number; y: number }>,
+) {
+  const tileMap = new Map(tiles.map((tile) => [tile.id, tile] as const));
+  const expandedTileIds: string[] = [];
+
+  for (let index = 0; index < tileIds.length; index += 1) {
+    const tileId = tileIds[index];
+    if (!tileId) {
+      continue;
+    }
+
+    if (!expandedTileIds.length) {
+      expandedTileIds.push(tileId);
+      continue;
+    }
+
+    const previousTileId = expandedTileIds[expandedTileIds.length - 1];
+    const segment = findWeightedTilePath(previousTileId, tileId, tileMap);
+    expandedTileIds.push(...segment.slice(1));
+  }
+
+  return densifyPolyline(materializeLanePoints(expandedTileIds, centers));
+}
+
+function traceSmoothLane(
+  context: CanvasRenderingContext2D,
+  points: Array<{ x: number; y: number }>,
+) {
+  if (points.length < 2) {
+    return;
+  }
+
+  context.beginPath();
+  context.moveTo(points[0].x, points[0].y);
+
+  if (points.length === 2 || typeof context.quadraticCurveTo !== 'function') {
+    for (const point of points.slice(1)) {
+      context.lineTo(point.x, point.y);
+    }
+    return;
+  }
+
+  for (let index = 1; index < points.length - 1; index += 1) {
+    const current = points[index];
+    const next = points[index + 1];
+    const midX = (current.x + next.x) / 2;
+    const midY = (current.y + next.y) / 2;
+    context.quadraticCurveTo(current.x, current.y, midX, midY);
+  }
+
+  const penultimate = points[points.length - 2];
+  const last = points[points.length - 1];
+  context.quadraticCurveTo(penultimate.x, penultimate.y, last.x, last.y);
 }
 
 export function MapCanvas({
@@ -343,11 +560,6 @@ export function MapCanvas({
           context.fillRect(center.x - layout.radius * 0.45, center.y + layout.radius * 0.36, layout.radius * 0.9, 4);
         }
       }
-
-      if (tile.activeDisasters.length) {
-        context.fillStyle = palette.hazardDisaster;
-        context.fillRect(center.x - layout.radius * 0.54, center.y - layout.radius * 0.48, 8, 8);
-      }
       if (tile.activePlagues.length) {
         context.beginPath();
         context.arc(center.x - layout.radius * 0.34, center.y - layout.radius * 0.44, 4.5, 0, Math.PI * 2);
@@ -381,6 +593,106 @@ export function MapCanvas({
         context.strokeStyle = tile.id === selectedTileId ? palette.selection : palette.hover;
         context.lineWidth = tile.id === selectedTileId ? 2.6 : 2;
         context.stroke();
+      }
+    }
+
+    const scriptedRiverLanes = (presentation.riverLanes ?? [])
+      .map((lane) => materializeRiverLanePoints(lane.tileIds, worldState.tiles, layout.centers))
+      .filter((points) => points.length > 1);
+
+    if (scriptedRiverLanes.length > 0) {
+      context.save();
+      context.lineCap = 'round';
+      context.lineJoin = 'round';
+
+      for (const points of scriptedRiverLanes) {
+        const width = clamp(2.1 + Math.sqrt(points.length) * 0.16, 2.2, 4.8);
+
+        context.strokeStyle = palette.riverGlow;
+        context.globalAlpha = themeMode === 'dark' ? 0.42 : 0.3;
+        context.lineWidth = width + 2.2;
+        traceSmoothLane(context, points);
+        context.stroke();
+
+        context.strokeStyle = palette.riverMain;
+        context.globalAlpha = themeMode === 'dark' ? 0.92 : 0.84;
+        context.lineWidth = width;
+        traceSmoothLane(context, points);
+        context.stroke();
+
+        context.strokeStyle = palette.riverHighlight;
+        context.globalAlpha = themeMode === 'dark' ? 0.55 : 0.4;
+        context.lineWidth = Math.max(0.9, width * 0.34);
+        traceSmoothLane(context, points);
+        context.stroke();
+      }
+
+      context.restore();
+    } else {
+      const riverTiles = worldState.tiles.filter(
+        (tile) => tile.terrain === 'river_valley' || (tile.water >= 5 && tile.terrain !== 'desert'),
+      );
+      const riverTileIds = new Set(riverTiles.map((tile) => tile.id));
+      const riverChains: Array<Array<{ x: number; y: number }>> = [];
+      const visitedRiverEdges = new Set<string>();
+
+      for (const tile of riverTiles) {
+        const center = layout.centers.get(tile.id);
+        if (!center) {
+          continue;
+        }
+        for (const neighborId of tile.neighbors) {
+          if (!riverTileIds.has(neighborId)) {
+            continue;
+          }
+          const edgeKey = [tile.id, neighborId].sort().join(':');
+          if (visitedRiverEdges.has(edgeKey)) {
+            continue;
+          }
+          visitedRiverEdges.add(edgeKey);
+          const neighborCenter = layout.centers.get(neighborId);
+          if (!neighborCenter) {
+            continue;
+          }
+          riverChains.push([center, neighborCenter]);
+        }
+      }
+
+      if (riverChains.length > 0 || riverTiles.length > 0) {
+        context.save();
+        context.lineCap = 'round';
+        context.lineJoin = 'round';
+
+        for (const chain of riverChains) {
+          if (chain.length < 2) {
+            continue;
+          }
+          context.strokeStyle = palette.riverMain;
+          context.globalAlpha = themeMode === 'dark' ? 0.42 : 0.34;
+          context.lineWidth = 2.4;
+          traceSmoothLane(context, chain);
+          context.stroke();
+        }
+
+        for (const tile of riverTiles) {
+          if (tile.terrain !== 'river_valley') {
+            continue;
+          }
+          const center = layout.centers.get(tile.id);
+          if (!center) {
+            continue;
+          }
+          const hasRiverNeighbor = tile.neighbors.some((neighborId) => riverTileIds.has(neighborId));
+          if (!hasRiverNeighbor) {
+            context.beginPath();
+            context.arc(center.x, center.y, layout.radius * 0.18, 0, Math.PI * 2);
+            context.fillStyle = palette.riverMain;
+            context.globalAlpha = themeMode === 'dark' ? 0.3 : 0.24;
+            context.fill();
+          }
+        }
+
+        context.restore();
       }
     }
 

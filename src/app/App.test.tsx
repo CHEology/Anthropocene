@@ -106,13 +106,15 @@ afterEach(() => {
 });
 
 describe('app shell', () => {
-  it('renders the simulator layout', () => {
+  it('renders the simulator layout with the authored old world defaults', () => {
     const { container } = render(<App />);
 
     expect(screen.getByRole('heading', { name: 'Anthropocene Simulator' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Run' })).toBeInTheDocument();
-    expect(screen.getByRole('heading', { name: 'Old World Corridor' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Detailed Old World' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Interventions' })).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'Corridor lanes' })).not.toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'Pressure markers' })).not.toBeChecked();
 
     const canvas = container.querySelector('canvas');
     expect(canvas).not.toBeNull();
@@ -134,22 +136,25 @@ describe('app shell', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.selectOptions(screen.getByRole('combobox', { name: 'Preset' }), 'detailed-eurasia');
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Preset' }), 'old-world-corridor');
 
-    expect(await screen.findByRole('heading', { name: 'Detailed Eurasia' })).toBeInTheDocument();
-    expect(screen.getByText(/A ~400-tile Eurasian field/i)).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'Old World Corridor' })).toBeInTheDocument();
+    expect(
+      await screen.findByText(/East African origin, Sahara friction, and Levantine breakout routes/i),
+    ).toBeInTheDocument();
   });
 
   it('surfaces tribe development details for the detailed preset', async () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.selectOptions(screen.getByRole('combobox', { name: 'Preset' }), 'detailed-eurasia');
     await user.click(screen.getByRole('button', { name: 'tribe' }));
 
     expect(screen.getByText('Leader State')).toBeInTheDocument();
-    expect(screen.getByText('Tending')).toBeInTheDocument();
+    expect(screen.getAllByText('Foraging').length).toBeGreaterThan(0);
     expect(screen.getByText('Food Stores')).toBeInTheDocument();
     expect(screen.getByText('Genetic')).toBeInTheDocument();
+    expect(screen.getByText('Technology Constellation')).toBeInTheDocument();
+    expect(screen.getByText(/Fire Mastery/i)).toBeInTheDocument();
   });
 });

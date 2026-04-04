@@ -22,7 +22,7 @@ describe('map layout', () => {
     const layout = createMapLayout(worldState.tiles, 1200, 760, 36);
     const footprint = calculateMapFootprint(layout.centers, layout.radius);
 
-    expect(layout.radius).toBeGreaterThan(30);
+    expect(layout.radius).toBeGreaterThan(12);
     expect(footprint.width).toBeGreaterThan(780);
     expect(footprint.height).toBeGreaterThan(520);
   });

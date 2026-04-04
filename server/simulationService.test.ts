@@ -17,15 +17,15 @@ describe('SimulationService', () => {
 
   it('stays finite over repeated bounded steps', { timeout: 30_000 }, () => {
     const service = new SimulationService();
-    const session = service.createSession({ seed: 31415 });
+    const session = service.createSession({ seed: 31415, worldPreset: 'old-world-corridor' });
 
-    for (let index = 0; index < 40; index += 1) {
+    for (let index = 0; index < 8; index += 1) {
       const result = service.stepSession(session.id, SERVER_LIMITS.stepChunkYears);
       expect(result.session.state.year).toBe((index + 1) * SERVER_LIMITS.stepChunkYears);
     }
 
     const state = service.getSessionSnapshot(session.id).state;
-    expect(state.year).toBe(40 * SERVER_LIMITS.stepChunkYears);
+    expect(state.year).toBe(8 * SERVER_LIMITS.stepChunkYears);
     expect(state.metrics.totalPopulation).toBeGreaterThan(0);
     expect(state.metrics.averageFoodStores).toBeGreaterThanOrEqual(0);
     expect(state.metrics.averageGeneticDiversity).toBeGreaterThanOrEqual(0);

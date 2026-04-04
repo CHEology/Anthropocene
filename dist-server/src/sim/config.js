@@ -1,16 +1,16 @@
 export const DEFAULT_GLOBALS = {
-    G_birth: 0.035,
-    G_death: 0.029,
-    G_hostility: 0.2,
-    G_disaster: 0.1,
-    G_innovation: 0.002,
-    G_cohesion: 0.9,
+    G_birth: 0.034,
+    G_death: 0.024,
+    G_hostility: 0.17,
+    G_disaster: 0.12,
+    G_innovation: 0.0022,
+    G_cohesion: 0.88,
     G_temp: 15,
-    G_migration: 0.1,
+    G_migration: 0.18,
 };
 export const DEFAULT_SIMULATION_CONFIG = {
     seed: 12045,
-    worldPreset: 'old-world-corridor',
+    worldPreset: 'detailed-eurasia',
     globals: { ...DEFAULT_GLOBALS },
     runtime: {
         yearsPerSecond: 8,

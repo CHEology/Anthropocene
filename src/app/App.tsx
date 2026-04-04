@@ -1,6 +1,7 @@
-﻿import { useDeferredValue, useEffect, useRef, useState, type CSSProperties } from 'react';
+import { useEffect, useRef, useState, type CSSProperties } from 'react';
 
 import { DEFAULT_SIMULATION_CONFIG, cloneSimulationConfig } from '../sim/config';
+import { getDiscoverableTechs, TECH_TREE } from '../sim/techTree';
 import type { InterventionCommand, SimulationConfig, SimulationEvent, TribeState } from '../sim/types';
 import { getWorldPresentation, WORLD_PRESET_OPTIONS } from '../world/oldWorld';
 import { MapCanvas } from './components/MapCanvas';
@@ -86,6 +87,15 @@ const STORYTELLER_POSTURE_LABELS: Record<string, string> = {
   prosperity: 'Prosperity',
   recovery: 'Recovery',
   crisis: 'Crisis',
+};
+
+
+const TECH_CATEGORY_LABELS: Record<string, string> = {
+  subsistence: 'Subsistence',
+  social: 'Social',
+  military: 'Military',
+  craft: 'Craft',
+  knowledge: 'Knowledge',
 };
 
 function clamp(value: number, min: number, max: number) {
@@ -322,9 +332,9 @@ export function App() {
   const [draftConfig, setDraftConfig] = useState<SimulationConfig>(() => cloneSimulationConfig(DEFAULT_SIMULATION_CONFIG));
   const [themeMode, setThemeMode] = useState<ThemeMode>(getInitialTheme);
   const [layerMode, setLayerMode] = useState<LayerMode>('comfort');
-  const [showRoutes, setShowRoutes] = useState(true);
+  const [showRoutes, setShowRoutes] = useState(false);
   const [showLabels, setShowLabels] = useState(true);
-  const [showPressure, setShowPressure] = useState(true);
+  const [showPressure, setShowPressure] = useState(false);
   const [leftRailOpen, setLeftRailOpen] = useState(false);
   const [rightRailOpen, setRightRailOpen] = useState(false);
   const [rightRailMinimized, setRightRailMinimized] = useState(false);
@@ -346,9 +356,8 @@ export function App() {
     note: 'Schedule climate disturbance for replayable analysis.',
   });
 
-  const deferredWorldState = useDeferredValue(controller.worldState);
   const liveWorldState = controller.worldState;
-  const controlsDisabled = controller.connectionState !== 'live';
+  const controlsDisabled = !controller.ready;
   const selectedTile = liveWorldState.tiles.find((tile) => tile.id === selectedTileId) ?? null;
   const selectedTribe = liveWorldState.tribes.find((tribe) => tribe.id === selectedTribeId) ?? null;
   const tribesOnSelectedTile = selectedTile
@@ -522,25 +531,46 @@ export function App() {
     setInterventionOpen(false);
   }
 
-  const history = deferredWorldState.history;
-  const activePulse = deferredWorldState.activeClimatePulses.reduce(
+  const history = liveWorldState.history;
+  const activePulse = liveWorldState.activeClimatePulses.reduce(
     (sum, pulse) => sum + pulse.temperatureDelta,
     0,
   );
   const relations = selectedTribe
     ? Object.entries(selectedTribe.relationships).sort((left, right) => right[1] - left[1])
     : [];
-  const activeDisasterCount = deferredWorldState.metrics.activeHazards;
-  const activePlagueCount = deferredWorldState.metrics.activePlagues;
-  const allianceCount = deferredWorldState.tribes.reduce((sum, tribe) => sum + tribe.alliances.length, 0) / 2;
+  const activeDisasterCount = liveWorldState.metrics.activeHazards;
+  const activePlagueCount = liveWorldState.metrics.activePlagues;
+  const allianceCount = liveWorldState.tribes.reduce((sum, tribe) => sum + tribe.alliances.length, 0) / 2;
   const selectedTileDisasters = selectedTile?.activeDisasters ?? [];
   const selectedTilePlagues = selectedTile?.activePlagues ?? [];
   const selectedTribeAllies = selectedTribe
     ? selectedTribe.alliances.map((allianceId) => tribeNameById.get(allianceId) ?? allianceId)
     : [];
-  const climateStatus = formatClimateRegime(deferredWorldState.globalClimate.regime);
-  const storytellerStatus = formatStorytellerPosture(deferredWorldState.storyteller.posture);
+  const selectedTribeTechnologyEntries = (selectedTribe?.knownTechnologies ?? []).reduce<Array<{
+    id: TribeState['knownTechnologies'][number];
+    name: string;
+    category: string;
+  }>>((entries, technologyId) => {
+    const technology = TECH_TREE[technologyId];
+    if (technology) {
+      entries.push({
+        id: technologyId,
+        name: technology.name,
+        category: TECH_CATEGORY_LABELS[technology.category] ?? technology.category,
+      });
+    }
+    return entries;
+  }, []);
+  const selectedTribeTechnologyPreview = selectedTribe
+    ? getDiscoverableTechs(selectedTribe.knownTechnologies ?? [])
+        .slice(0, 4)
+        .map((technologyId) => TECH_TREE[technologyId]?.name ?? technologyId)
+    : [];
+  const climateStatus = formatClimateRegime(liveWorldState.globalClimate.regime);
+  const storytellerStatus = formatStorytellerPosture(liveWorldState.storyteller.posture);
   const selectedTribeViability = selectedTribe ? formatViability(selectedTribe) : null;
+  const chronologyEvents = liveWorldState.eventLog.filter((event) => event.kind !== 'migration').slice(0, 8);
 
   return (
     <div
@@ -552,14 +582,14 @@ export function App() {
           <p className="eyebrow">Migration Analysis Console</p>
           <h1>Anthropocene Simulator</h1>
           <p className="title-block__summary">
-            Deterministic world-state dashboard for early-human migration modeling. {controller.connectionState === 'live' ? 'Backend connected.' : controller.connectionState === 'connecting' ? 'Connecting to backend...' : `Backend error: ${controller.error ?? 'Unavailable.'}`}
+            Deterministic world-state dashboard for early-human migration modeling. {controller.error ? `Error: ${controller.error}` : 'Engine running locally.'}
           </p>
           <div className="metric-grid metric-grid--topbar">
-            <MetricChip label="Year" value={`${deferredWorldState.year}`} />
-            <MetricChip label="Population" value={`${deferredWorldState.metrics.totalPopulation}`} />
+            <MetricChip label="Year" value={`${liveWorldState.year}`} />
+            <MetricChip label="Population" value={`${liveWorldState.metrics.totalPopulation}`} />
             <MetricChip label="Climate Regime" value={climateStatus} />
-            <MetricChip label="Queued" value={`${deferredWorldState.pendingInterventions.length}`} />
-            <MetricChip label="Backend" value={controller.connectionState === 'live' ? 'Live' : controller.connectionState === 'connecting' ? 'Connecting' : 'Error'} />
+            <MetricChip label="Queued" value={`${liveWorldState.pendingInterventions.length}`} />
+            <MetricChip label="Engine" value={controller.ready ? 'Local' : 'Loading'} />
           </div>
         </div>
 
@@ -658,10 +688,10 @@ export function App() {
             <h2>{presentation.name}</h2>
           </div>
           <div className="map-stage__stats">
-            <MetricChip label="Tiles" value={`${deferredWorldState.tiles.length}`} />
-            <MetricChip label="Tribes" value={`${deferredWorldState.metrics.tribeCount}`} />
-            <MetricChip label="Avg Comfort" value={deferredWorldState.metrics.averageComfort.toFixed(2)} />
-            <MetricChip label="Avg Pressure" value={deferredWorldState.metrics.averagePressure.toFixed(2)} />
+            <MetricChip label="Tiles" value={`${liveWorldState.tiles.length}`} />
+            <MetricChip label="Tribes" value={`${liveWorldState.metrics.tribeCount}`} />
+            <MetricChip label="Avg Comfort" value={liveWorldState.metrics.averageComfort.toFixed(2)} />
+            <MetricChip label="Avg Pressure" value={liveWorldState.metrics.averagePressure.toFixed(2)} />
           </div>
         </div>
         <MapCanvas
@@ -723,22 +753,22 @@ export function App() {
                 <p>Current simulation state and active shell instrumentation.</p>
               </div>
               <div className="metric-grid">
-                <MetricChip label="Innovations" value={`${deferredWorldState.metrics.innovations}`} />
-                <MetricChip label="Conflict Alerts" value={`${deferredWorldState.metrics.conflicts}`} />
+                <MetricChip label="Innovations" value={`${liveWorldState.metrics.innovations}`} />
+                <MetricChip label="Conflict Alerts" value={`${liveWorldState.metrics.conflicts}`} />
                 <MetricChip label="Active Hazards" value={`${activeDisasterCount}`} />
                 <MetricChip label="Active Plagues" value={`${activePlagueCount}`} />
-                <MetricChip label="Avg Stores" value={formatPercent(deferredWorldState.metrics.averageFoodStores)} />
-                <MetricChip label="Avg Diversity" value={formatPercent(deferredWorldState.metrics.averageGeneticDiversity)} />
-                <MetricChip label="Avg Megafauna" value={formatPercent(deferredWorldState.metrics.averageMegafauna)} />
-                <MetricChip label="Tick Status" value={controller.running ? 'Running' : controller.connectionState === 'connecting' ? 'Connecting' : controller.connectionState === 'error' ? 'Offline' : 'Paused'} />
+                <MetricChip label="Avg Stores" value={formatPercent(liveWorldState.metrics.averageFoodStores)} />
+                <MetricChip label="Avg Diversity" value={formatPercent(liveWorldState.metrics.averageGeneticDiversity)} />
+                <MetricChip label="Avg Megafauna" value={formatPercent(liveWorldState.metrics.averageMegafauna)} />
+                <MetricChip label="Tick Status" value={controller.running ? 'Running' : controller.ready ? 'Paused' : 'Loading'} />
               </div>
               <div className="subsection">
                 <h3>Climate and Pacing</h3>
                 <div className="detail-list">
                   <div className="detail-row"><span>Climate Regime</span><strong>{climateStatus}</strong></div>
                   <div className="detail-row"><span>Storyteller</span><strong>{storytellerStatus}</strong></div>
-                  <div className="detail-row"><span>Prosperity</span><strong>{formatPercent(deferredWorldState.storyteller.prosperity)}</strong></div>
-                  <div className="detail-row"><span>Disaster / Recovery</span><strong>{`${deferredWorldState.storyteller.disasterMultiplier.toFixed(2)} / ${deferredWorldState.storyteller.recoveryMultiplier.toFixed(2)}`}</strong></div>
+                  <div className="detail-row"><span>Prosperity</span><strong>{formatPercent(liveWorldState.storyteller.prosperity)}</strong></div>
+                  <div className="detail-row"><span>Disaster / Recovery</span><strong>{`${liveWorldState.storyteller.disasterMultiplier.toFixed(2)} / ${liveWorldState.storyteller.recoveryMultiplier.toFixed(2)}`}</strong></div>
                 </div>
               </div>
               <AbilityRows tribe={selectedTribe} />
@@ -808,6 +838,7 @@ export function App() {
                     <MetricChip label="Trade" value={selectedTribe.exchange.tradeVolume.toFixed(2)} />
                     <MetricChip label="War Wear" value={selectedTribe.exchange.warExhaustion.toFixed(2)} />
                     <MetricChip label="Allies" value={`${selectedTribe.alliances.length}`} />
+                    <MetricChip label="Tech" value={`${selectedTribeTechnologyEntries.length}`} />
                   </div>
                   <div className="subsection">
                     <h3>Leader State</h3>
@@ -827,6 +858,18 @@ export function App() {
                       <div className="detail-row"><span>Climate / Story</span><strong>{`${climateStatus} / ${storytellerStatus}`}</strong></div>
                       <div className="detail-row"><span>Tile</span><strong>{selectedTribe.tileId}</strong></div>
                       <div className="detail-row"><span>Ancestry</span><strong>{selectedTribe.ancestryId}</strong></div>
+                    </div>
+                  </div>
+                  <div className="subsection">
+                    <h3>Technology Constellation</h3>
+                    <div className="detail-list">
+                      <div className="detail-row"><span>Known Technologies</span><strong>{selectedTribeTechnologyEntries.length}</strong></div>
+                      <div className="detail-row"><span>Next Reachable</span><strong>{selectedTribeTechnologyPreview.length ? selectedTribeTechnologyPreview.join(', ') : 'None'}</strong></div>
+                    </div>
+                    <div className="tag-list">
+                      {selectedTribeTechnologyEntries.length ? selectedTribeTechnologyEntries.map((technology) => (
+                        <StatusChip key={technology.id} label={`${technology.name} | ${technology.category}`} tone={technology.category === 'Military' ? 'danger' : technology.category === 'Subsistence' ? 'success' : technology.category === 'Craft' ? 'info' : 'default'} />
+                      )) : <StatusChip label="No retained technologies" />}
                     </div>
                   </div>
                   <div className="tag-list">
@@ -877,7 +920,7 @@ export function App() {
                 <p>Replayable event chronology derived from seed + intervention sequence.</p>
               </div>
               <div className="event-stack">
-                {deferredWorldState.eventLog.map((event) => (
+                {liveWorldState.eventLog.map((event) => (
                   <article className={`event-card event-card--${event.kind}`} key={event.id}>
                     <div className="event-card__meta">
                       <span>{event.kind}</span>
@@ -897,10 +940,10 @@ export function App() {
 
       <section className="timeline-strip panel-surface">
         <div className="timeline-strip__charts">
-          <ChartCard label="Population" value={deferredWorldState.metrics.totalPopulation} color="#d0d5dd" history={history.map((entry) => entry.totalPopulation)} />
-          <ChartCard label="Tribe Count" value={deferredWorldState.metrics.tribeCount} color="#7aa2c8" history={history.map((entry) => entry.tribeCount)} />
-          <ChartCard label="Innovations" value={deferredWorldState.metrics.innovations} color="#7e9f74" history={history.map((entry) => entry.innovations)} />
-          <ChartCard label="Conflict Alerts" value={deferredWorldState.metrics.conflicts} color="#ba6a4a" history={history.map((entry) => entry.conflicts)} />
+          <ChartCard label="Population" value={liveWorldState.metrics.totalPopulation} color="#d0d5dd" history={history.map((entry) => entry.totalPopulation)} />
+          <ChartCard label="Tribe Count" value={liveWorldState.metrics.tribeCount} color="#7aa2c8" history={history.map((entry) => entry.tribeCount)} />
+          <ChartCard label="Innovations" value={liveWorldState.metrics.innovations} color="#7e9f74" history={history.map((entry) => entry.innovations)} />
+          <ChartCard label="Conflict Alerts" value={liveWorldState.metrics.conflicts} color="#ba6a4a" history={history.map((entry) => entry.conflicts)} />
         </div>
         <div className="timeline-strip__events">
           <div className="section-heading">
@@ -908,7 +951,7 @@ export function App() {
             <p>Recent simulation entries pinned for operational review.</p>
           </div>
           <div className="chronology-list">
-            {deferredWorldState.eventLog.slice(0, 8).map((event) => (
+            {chronologyEvents.map((event) => (
               <ChronologyEntry event={event} key={event.id} />
             ))}
           </div>
@@ -954,7 +997,7 @@ export function App() {
         <div className="subsection">
           <h3>Queued Commands</h3>
           <div className="list-stack list-stack--compact">
-            {deferredWorldState.pendingInterventions.length ? deferredWorldState.pendingInterventions.map((command) => (
+            {liveWorldState.pendingInterventions.length ? liveWorldState.pendingInterventions.map((command) => (
               <div className="list-row" key={command.id}>
                 <span>{command.label}</span>
                 <strong>Y{command.scheduledYear}</strong>

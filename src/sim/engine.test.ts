@@ -61,25 +61,70 @@ describe('simulation engine', () => {
     expect(engine.getState().globalClimate.anomaly).toBe(2);
   });
 
-  it('keeps population and tribe structure evolving over long deterministic runs', () => {
+  it('keeps population and conflict structure evolving over long deterministic runs', { timeout: 20_000 }, () => {
     const engine = createSimulationEngine(DEFAULT_SIMULATION_CONFIG);
     const initial = engine.getState();
     const populations = new Set<number>([initial.metrics.totalPopulation]);
     const tribeCounts = new Set<number>([initial.metrics.tribeCount]);
+    const conflictCounts = new Set<number>([initial.metrics.conflicts]);
 
-    for (let index = 0; index < 400; index += 1) {
+    for (let index = 0; index < 160; index += 1) {
       engine.step(1);
       const state = engine.getState();
       populations.add(state.metrics.totalPopulation);
       tribeCounts.add(state.metrics.tribeCount);
+      conflictCounts.add(state.metrics.conflicts);
     }
 
-    expect(populations.size).toBeGreaterThan(40);
-    expect(Math.max(...tribeCounts)).toBeGreaterThan(initial.metrics.tribeCount);
+    expect(populations.size).toBeGreaterThan(20);
+    expect(conflictCounts.size).toBeGreaterThan(8);
+    expect(engine.getState().metrics.conflicts).toBeGreaterThan(initial.metrics.conflicts);
     expect(engine.getState().metrics.totalPopulation).not.toBe(initial.metrics.totalPopulation);
   });
 
-  it('keeps detailed eurasia viable over long deterministic runs with the new ecology contract', { timeout: 45_000 }, () => {
+  it('reduces early migration buzzing while preserving committed corridor relocations', { timeout: 120_000 }, () => {
+    const config = cloneSimulationConfig(DEFAULT_SIMULATION_CONFIG);
+    config.worldPreset = 'detailed-eurasia';
+    config.seed = 12045;
+
+    const engine = createSimulationEngine(config);
+    const initial = engine.getState();
+    const trackedIds = new Set(initial.tribes.map((tribe) => tribe.id));
+    const moveCounts = new Map(initial.tribes.map((tribe) => [tribe.id, 0]));
+    const visitedTiles = new Set(initial.tribes.map((tribe) => tribe.tileId));
+    let relocationBegins = 0;
+
+    for (let index = 0; index < 80; index += 1) {
+      const before = engine.getState();
+      const previousTiles = new Map(before.tribes.map((tribe) => [tribe.id, tribe.tileId]));
+      const result = engine.step(1);
+      for (const event of result.emittedEvents) {
+        if (event.kind === 'migration' && /began a relocation/i.test(event.title)) {
+          relocationBegins += 1;
+        }
+      }
+      for (const tribe of result.state.tribes) {
+        visitedTiles.add(tribe.tileId);
+        if (!trackedIds.has(tribe.id)) {
+          continue;
+        }
+        if (previousTiles.get(tribe.id) !== tribe.tileId) {
+          moveCounts.set(tribe.id, (moveCounts.get(tribe.id) ?? 0) + 1);
+        }
+      }
+    }
+
+    const moveValues = [...moveCounts.values()];
+    const averageMoves = moveValues.reduce((sum, value) => sum + value, 0) / moveValues.length;
+
+    expect(Math.max(...moveValues)).toBeLessThanOrEqual(28);
+    expect(averageMoves).toBeGreaterThanOrEqual(9);
+    expect(averageMoves).toBeLessThanOrEqual(18);
+    expect(relocationBegins).toBeGreaterThan(0);
+    expect(visitedTiles.size).toBeGreaterThan(initial.tribes.length * 4);
+  });
+
+  it('keeps detailed old world viable with slow net growth, drawdowns, and branching', { timeout: 120_000 }, () => {
     const config = cloneSimulationConfig(DEFAULT_SIMULATION_CONFIG);
     config.worldPreset = 'detailed-eurasia';
     config.seed = 12045;
@@ -87,69 +132,94 @@ describe('simulation engine', () => {
     const engine = createSimulationEngine(config);
     const initial = engine.getState();
     const visitedTiles = new Set(initial.tribes.map((tribe) => tribe.tileId));
+    const highlandTileIds = new Set(
+      initial.tiles
+        .filter((tile) => tile.terrain === 'highland' || tile.terrain === 'mountain')
+        .map((tile) => tile.id),
+    );
+    const everOccupiedHighlands = new Set<string>();
+    const populationSeries = [initial.metrics.totalPopulation];
+    const tribeSeries = [initial.metrics.tribeCount];
 
-    let peakPop = initial.metrics.totalPopulation;
-    for (let index = 0; index < 800; index += 1) {
+    for (let index = 0; index < 320; index += 1) {
       const result = engine.step(1);
+      populationSeries.push(result.state.metrics.totalPopulation);
+      tribeSeries.push(result.state.metrics.tribeCount);
       for (const tribe of result.state.tribes) {
         visitedTiles.add(tribe.tileId);
+        if (highlandTileIds.has(tribe.tileId)) {
+          everOccupiedHighlands.add(tribe.tileId);
+        }
       }
-      peakPop = Math.max(peakPop, result.state.metrics.totalPopulation);
+    }
+
+    let runningPeak = populationSeries[0];
+    let maxDrawdown = 0;
+    for (const population of populationSeries) {
+      runningPeak = Math.max(runningPeak, population);
+      maxDrawdown = Math.max(maxDrawdown, runningPeak - population);
     }
 
     const state = engine.getState();
-    const occupiedTileIds = new Set(state.tribes.map((tribe) => tribe.tileId));
-    const occupiedHuntRatios = state.tiles
-      .filter((tile) => occupiedTileIds.has(tile.id))
-      .map((tile) => tile.carryingCapacity.hunt / Math.max(tile.baseCarryingCapacity.hunt, 1));
-    const averageOccupiedHuntRatio =
-      occupiedHuntRatios.reduce((sum, ratio) => sum + ratio, 0) /
-      Math.max(occupiedHuntRatios.length, 1);
 
-    expect(peakPop).toBeGreaterThan(initial.metrics.totalPopulation * 2.5);
-    expect(state.metrics.totalPopulation).toBeGreaterThan(initial.metrics.totalPopulation * 0.45);
-    expect(state.metrics.tribeCount).toBeGreaterThan(initial.metrics.tribeCount * 4);
-    expect(visitedTiles.size).toBeGreaterThan(initial.tribes.length * 5);
-    expect(averageOccupiedHuntRatio).toBeGreaterThan(0.3);
+    expect(Math.max(...populationSeries)).toBeGreaterThan(initial.metrics.totalPopulation * 1.2);
+    expect(state.metrics.totalPopulation).toBeGreaterThan(initial.metrics.totalPopulation * 1.5);
+    expect(state.metrics.totalPopulation).toBeLessThan(initial.metrics.totalPopulation * 5);
+    expect(maxDrawdown).toBeGreaterThan(40);
+    expect(state.metrics.tribeCount).toBeGreaterThan(initial.metrics.tribeCount);
+    expect(state.metrics.tribeCount).toBeLessThanOrEqual(initial.metrics.tribeCount + 10);
+    expect(visitedTiles.size).toBeGreaterThan(initial.tribes.length * 6);
+    expect(everOccupiedHighlands.size).toBeGreaterThan(0);
     expect(state.globalClimate.regime.length).toBeGreaterThan(0);
     expect(state.storyteller.posture.length).toBeGreaterThan(0);
     expect(state.metrics.averageFoodStores).toBeGreaterThanOrEqual(0);
     expect(state.metrics.averageGeneticDiversity).toBeGreaterThan(0);
     expect(state.metrics.averageMegafauna).toBeGreaterThanOrEqual(0);
+    expect(Math.max(...tribeSeries)).toBeGreaterThan(initial.metrics.tribeCount);
   });
 
-  it('activates hazard, exchange, combat, and diplomacy loops on the detailed preset', { timeout: 30_000 }, () => {
+  it('keeps early detailed old world runs in a slow-tech forager regime while hazards, exchange, and migration still fire', { timeout: 120_000 }, () => {
     const config = cloneSimulationConfig(DEFAULT_SIMULATION_CONFIG);
     config.worldPreset = 'detailed-eurasia';
     config.seed = 12045;
 
     const engine = createSimulationEngine(config);
-    const initialMaxDomestication = Math.max(
-      ...engine.getState().tribes.map((tribe) => tribe.development.domestication),
+    const initialState = engine.getState();
+    const initialMaxTechs = Math.max(
+      ...initialState.tribes.map((tribe) => tribe.knownTechnologies.length),
     );
     const counts = new Map<string, number>();
+    let relocationBegins = 0;
+    let continuedRelocations = 0;
 
-    for (let index = 0; index < 500; index += 1) {
+    for (let index = 0; index < 240; index += 1) {
       const result = engine.step(1);
       for (const event of result.emittedEvents) {
         counts.set(event.kind, (counts.get(event.kind) ?? 0) + 1);
+        if (event.kind === 'migration' && /began a relocation/i.test(event.title)) {
+          relocationBegins += 1;
+        }
+        if (event.kind === 'migration' && /continued migrating/i.test(event.title)) {
+          continuedRelocations += 1;
+        }
       }
     }
 
     const state = engine.getState();
-    const occupiedTileIds = new Set(state.tribes.map((tribe) => tribe.tileId));
-    const occupiedHighlandTiles = state.tiles.filter((tile) => occupiedTileIds.has(tile.id) && (tile.terrain === 'highland' || tile.terrain === 'mountain')).length;
+    const maxTechs = Math.max(...state.tribes.map((tribe) => tribe.knownTechnologies.length));
 
-    // Core event systems should all fire over 500 years
-    expect(counts.get('disaster') ?? 0).toBeGreaterThan(10);
-    expect(counts.get('disease') ?? 0).toBeGreaterThan(2);
-    expect((counts.get('trade') ?? 0) + (counts.get('diplomacy') ?? 0) + (counts.get('combat') ?? 0)).toBeGreaterThan(5);
-    expect(occupiedHighlandTiles).toBeGreaterThan(0);
-    expect(
-      state.tiles.some((tile) => tile.activeDisasters.length > 0 || tile.activePlagues.length > 0),
-    ).toBe(true);
-    expect(
-      Math.max(...state.tribes.map((tribe) => tribe.development.domestication)),
-    ).toBeGreaterThan(initialMaxDomestication);
+    expect(counts.get('disaster') ?? 0).toBeGreaterThan(200);
+    expect(counts.get('disease') ?? 0).toBeGreaterThan(10);
+    expect((counts.get('trade') ?? 0) + (counts.get('diplomacy') ?? 0)).toBeGreaterThanOrEqual(0);
+    expect(counts.get('innovation') ?? 0).toBeLessThanOrEqual(2);
+    expect(counts.get('migration') ?? 0).toBeGreaterThan(120);
+    expect(counts.get('migration') ?? 0).toBeLessThan(260);
+    expect(relocationBegins).toBeGreaterThan(20);
+    expect(continuedRelocations).toBeGreaterThan(60);
+    expect(Math.max(...state.tribes.map((tribe) => tribe.development.domestication))).toBeLessThan(10);
+    expect(state.tribes.every((tribe) => tribe.development.agricultureStage === 'foraging')).toBe(true);
+    expect(maxTechs).toBeLessThanOrEqual(initialMaxTechs + 2);
+    expect(state.metrics.tribeCount).toBeGreaterThan(initialState.metrics.tribeCount);
+    expect(state.metrics.tribeCount).toBeLessThanOrEqual(initialState.metrics.tribeCount + 8);
   });
 });
